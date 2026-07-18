@@ -13,6 +13,7 @@
 //!   arity-filtered address-taken set. SCCs that close only through indirect edges are POSSIBLE
 //!   findings naming the indirect edge they depend on.
 
+pub mod chsig;
 pub mod collect;
 pub mod graph;
 pub mod index;

@@ -277,6 +277,10 @@ fn fold_tu(
             name_range: off..off,
             name_line: line,
             arity: s.arity,
+            // Same reason as the ranges above: expanded-TU spans do not exist in the real file,
+            // and a rewriter must not be handed coordinates that look usable but are not.
+            params_range: None,
+            param_ranges: Vec::new(),
         });
         acc.stub_ix.insert(key, ix);
         placed.push(Some((path, ix)));
@@ -307,6 +311,11 @@ fn fold_tu(
             callee: c.callee.clone(),
             offset: off,
             mined_from_macro: false, // nothing is "mined" here — cpp already expanded it
+            // Offsets here are RE-ATTRIBUTED from the translation unit back to an including
+            // file, so any span from the TU text would point at the wrong bytes. Withhold them
+            // rather than hand a rewriter coordinates that look valid and are not.
+            args_range: None,
+            arg_ranges: Vec::new(),
         });
     }
 

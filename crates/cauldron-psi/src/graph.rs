@@ -776,11 +776,20 @@ mod tests {
             name_range: 0..0,
             name_line: 0,
             arity,
+            params_range: None,
+            param_ranges: Vec::new(),
         }
     }
 
     fn call(caller: u32, callee: &str, offset: usize, mined: bool) -> CallSite {
-        CallSite { caller_stub: caller, callee: callee.into(), offset, mined_from_macro: mined }
+        CallSite {
+            caller_stub: caller,
+            callee: callee.into(),
+            offset,
+            mined_from_macro: mined,
+            args_range: None,
+            arg_ranges: Vec::new(),
+        }
     }
 
     fn facts(stubs: Vec<Stub>, calls: Vec<CallSite>) -> FileFacts {

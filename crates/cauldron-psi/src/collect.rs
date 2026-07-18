@@ -83,6 +83,14 @@ pub struct Stub {
     pub name_line: usize,
     /// Parameter count; `None` when variadic or syntactically unknowable (K&R `()`).
     pub arity: Option<u8>,
+    /// Span of the `parameter_list` INCLUDING its parentheses, i.e. `(int a, int b)`.
+    /// `None` for macros and typedefs, and for anything with no parseable parameter list.
+    /// Change Signature rewrites exactly this span on the declaration side.
+    pub params_range: Option<Range<usize>>,
+    /// Byte span of each parameter declaration, in source order, excluding commas and comments.
+    /// A lone `void` yields NO entries (it means zero parameters, not one named `void`); a
+    /// variadic `...` contributes its own span so a rewriter can preserve it.
+    pub param_ranges: Vec<Range<usize>>,
 }
 
 /// One direct call site: `callee` is a plain identifier at the call position.
@@ -94,6 +102,15 @@ pub struct CallSite {
     pub callee: String,
     pub offset: usize,
     pub mined_from_macro: bool,
+    /// Span of the `argument_list` INCLUDING its parentheses, i.e. `(a, b)` in `f(a, b)`.
+    /// `None` for macro-mined calls, whose offsets point into a macro body rather than a real
+    /// call expression — those must never be rewritten. Rewriting refactors (Change Signature)
+    /// key off this; it is deliberately excluded from the file hashes so that pure body edits
+    /// which merely shift bytes stay free.
+    pub args_range: Option<Range<usize>>,
+    /// Byte span of each argument expression, in source order, excluding commas and whitespace.
+    /// Empty for a zero-argument call. `None` alongside a `None` [`Self::args_range`].
+    pub arg_ranges: Vec<Range<usize>>,
 }
 
 /// Everything one file contributes to the index — a pure function of the file text.
@@ -163,6 +180,11 @@ pub fn file_facts(text: &str) -> FileFacts {
                                 name_range: name_node.byte_range(),
                                 name_line: name_node.start_position().row,
                                 arity: info.params.and_then(|p| params_arity(p, text)),
+                                params_range: info.params.map(|p| p.byte_range()),
+                                param_ranges: info
+                                    .params
+                                    .map(|p| param_ranges(p, text))
+                                    .unwrap_or_default(),
                             });
                             fn_stack.push((idx, node.end_byte()));
                         }
@@ -187,6 +209,11 @@ pub fn file_facts(text: &str) -> FileFacts {
                                 name_range: name_node.byte_range(),
                                 name_line: name_node.start_position().row,
                                 arity: info.params.and_then(|p| params_arity(p, text)),
+                                params_range: info.params.map(|p| p.byte_range()),
+                                param_ranges: info
+                                    .params
+                                    .map(|p| param_ranges(p, text))
+                                    .unwrap_or_default(),
                             });
                         }
                     }
@@ -205,6 +232,9 @@ pub fn file_facts(text: &str) -> FileFacts {
                                 name_range: name_node.byte_range(),
                                 name_line: name_node.start_position().row,
                                 arity: None,
+                                // Typedefs have no parameter_list to rewrite.
+                                params_range: None,
+                                param_ranges: Vec::new(),
                             });
                         }
                     }
@@ -222,6 +252,10 @@ pub fn file_facts(text: &str) -> FileFacts {
                             arity: node
                                 .child_by_field_name("parameters")
                                 .and_then(macro_params_arity),
+                            // `preproc_params` is not a C parameter_list; Change Signature does
+                            // not rewrite macros, so withhold spans rather than offer bad ones.
+                            params_range: None,
+                            param_ranges: Vec::new(),
                         });
                         if let Some(v) = node.child_by_field_name("value") {
                             macro_bodies.push((idx, v.byte_range()));
@@ -239,6 +273,9 @@ pub fn file_facts(text: &str) -> FileFacts {
                             name_range: name_node.byte_range(),
                             name_line: name_node.start_position().row,
                             arity: None,
+                            // Object-like macro: no parameter list at all.
+                            params_range: None,
+                            param_ranges: Vec::new(),
                         });
                         if let Some(v) = node.child_by_field_name("value") {
                             macro_bodies.push((idx, v.byte_range()));
@@ -249,11 +286,14 @@ pub fn file_facts(text: &str) -> FileFacts {
                     let caller = fn_stack.last().map_or(TOP_LEVEL, |&(i, _)| i);
                     if let Some(f) = node.child_by_field_name("function") {
                         if f.kind() == kind::IDENTIFIER {
+                            let args = node.child_by_field_name("arguments");
                             calls.push(CallSite {
                                 caller_stub: caller,
                                 callee: text[f.byte_range()].to_string(),
                                 offset: node.start_byte(),
                                 mined_from_macro: false,
+                                args_range: args.map(|a| a.byte_range()),
+                                arg_ranges: args.map(arg_ranges).unwrap_or_default(),
                             });
                         } else {
                             // Indirect: field/pointer/array/paren callee. Best-effort arity for
@@ -427,6 +467,25 @@ fn has_static(node: Node, text: &str) -> bool {
         .any(|c| c.kind() == kind::STORAGE_CLASS_SPECIFIER && &text[c.byte_range()] == "static")
 }
 
+/// Byte span of each parameter in a `parameter_list`, in source order.
+///
+/// A single `void` parameter is C's spelling of "no parameters" and yields an EMPTY list, so
+/// callers can treat `param_ranges.len()` as the real parameter count. `...` is included, so a
+/// rewriter can keep a variadic tail while editing the fixed parameters before it.
+fn param_ranges(params: Node, text: &str) -> Vec<Range<usize>> {
+    let named: Vec<Node> = (0..params.named_child_count())
+        .filter_map(|i| params.named_child(i))
+        .filter(|c| c.kind() != kind::COMMENT)
+        .collect();
+    if named.len() == 1
+        && named[0].kind() == kind::PARAMETER_DECLARATION
+        && text[named[0].byte_range()].trim() == "void"
+    {
+        return Vec::new();
+    }
+    named.into_iter().map(|c| c.byte_range()).collect()
+}
+
 /// Parameter count for a `parameter_list`. `None` = variadic or unknowable (K&R `()`).
 fn params_arity(params: Node, text: &str) -> Option<u8> {
     let mut named: Vec<Node> = Vec::new();
@@ -467,6 +526,19 @@ fn macro_params_arity(params: Node) -> Option<u8> {
         }
     }
     u8::try_from(n).ok()
+}
+
+/// Byte span of each argument expression at a call site, in source order.
+///
+/// Comments are skipped so `f(a /* why */, b)` yields two arguments, matching [`args_arity`].
+/// Spans cover the expression only — commas, the enclosing parens, and surrounding whitespace
+/// are excluded, so a rewriter can replace an argument without disturbing the call's layout.
+fn arg_ranges(args: Node) -> Vec<Range<usize>> {
+    (0..args.named_child_count())
+        .filter_map(|i| args.named_child(i))
+        .filter(|c| c.kind() != kind::COMMENT)
+        .map(|c| c.byte_range())
+        .collect()
 }
 
 /// Best-effort argument count at a call site.
@@ -535,6 +607,11 @@ fn mine_macro_body(
             callee,
             offset: value.start + off,
             mined_from_macro: true,
+            // A macro-mined "call" is text inside a macro BODY, not a call expression. Its
+            // offset is useful for the call graph but there is nothing here a rewriter may
+            // safely edit — every expansion site would need its own edit.
+            args_range: None,
+            arg_ranges: Vec::new(),
         });
     }
 }
@@ -693,6 +770,97 @@ mod tests {
             .calls
             .iter()
             .any(|c| c.callee == "do_kick" && c.mined_from_macro));
+    }
+
+    #[test]
+    fn param_and_arg_spans_cover_exact_source_text() {
+        let src = "\
+int add(int a, char *b) { return 0; }
+void call_it(void) { add(1 + 2, \"hi\"); }
+";
+        let f = file_facts(src);
+        let add = f.stubs.iter().find(|s| s.name == "add" && s.kind == StubKind::FnDef).unwrap();
+        // The params span includes the parens, so a rewriter replaces the whole list at once.
+        assert_eq!(&src[add.params_range.clone().unwrap()], "(int a, char *b)");
+        let params: Vec<&str> =
+            add.param_ranges.iter().map(|r| &src[r.clone()]).collect();
+        assert_eq!(params, ["int a", "char *b"]);
+
+        let call = f.calls.iter().find(|c| c.callee == "add").unwrap();
+        assert_eq!(&src[call.args_range.clone().unwrap()], "(1 + 2, \"hi\")");
+        // Argument spans cover the expression only — no commas, no surrounding whitespace —
+        // so replacing one leaves the call's formatting untouched.
+        let args: Vec<&str> = call.arg_ranges.iter().map(|r| &src[r.clone()]).collect();
+        assert_eq!(args, ["1 + 2", "\"hi\""]);
+    }
+
+    #[test]
+    fn lone_void_param_is_zero_parameters_not_one() {
+        // `f(void)` means NO parameters in C. A rewriter that saw one parameter here would try
+        // to keep or reorder a parameter that does not exist.
+        let f = file_facts("void f(void) {}\nvoid g() {}\n");
+        let vf = f.stubs.iter().find(|s| s.name == "f").unwrap();
+        assert!(vf.param_ranges.is_empty());
+        assert_eq!(vf.arity, Some(0));
+        // K&R `()` is unspecified, not zero — no params to list either.
+        let g = f.stubs.iter().find(|s| s.name == "g").unwrap();
+        assert!(g.param_ranges.is_empty());
+        assert_eq!(g.arity, None);
+    }
+
+    #[test]
+    fn variadic_tail_gets_its_own_param_span() {
+        let src = "int logf(const char *fmt, ...);\n";
+        let f = file_facts(src);
+        let d = f.stubs.iter().find(|s| s.name == "logf").unwrap();
+        let params: Vec<&str> = d.param_ranges.iter().map(|r| &src[r.clone()]).collect();
+        // `...` is preserved as a span so the fixed parameters before it can be edited while
+        // the variadic tail survives.
+        assert_eq!(params, ["const char *fmt", "..."]);
+        assert_eq!(d.arity, None);
+    }
+
+    #[test]
+    fn zero_arg_call_has_empty_arg_ranges_but_a_real_args_span() {
+        let src = "void f(void); void g(void) { f(); }\n";
+        let f = file_facts(src);
+        let call = f.calls.iter().find(|c| c.callee == "f").unwrap();
+        assert!(call.arg_ranges.is_empty());
+        // The span still exists — that is where an added argument gets inserted.
+        assert_eq!(&src[call.args_range.clone().unwrap()], "()");
+    }
+
+    #[test]
+    fn macro_mined_calls_withhold_spans() {
+        // Offsets inside a macro BODY are not a call expression; handing a rewriter spans here
+        // would corrupt the macro definition.
+        let f = file_facts("#define M() target(1)\nvoid u(void) { M(); }\n");
+        let mined = f.calls.iter().find(|c| c.mined_from_macro).unwrap();
+        assert_eq!(mined.callee, "target");
+        assert!(mined.args_range.is_none());
+        assert!(mined.arg_ranges.is_empty());
+    }
+
+    #[test]
+    fn nested_call_args_are_spanned_per_call_not_flattened() {
+        let src = "void u(void) { outer(inner(1, 2), 3); }\n";
+        let f = file_facts(src);
+        let outer = f.calls.iter().find(|c| c.callee == "outer").unwrap();
+        let outer_args: Vec<&str> = outer.arg_ranges.iter().map(|r| &src[r.clone()]).collect();
+        // The whole nested call is ONE argument of `outer`.
+        assert_eq!(outer_args, ["inner(1, 2)", "3"]);
+        let inner = f.calls.iter().find(|c| c.callee == "inner").unwrap();
+        let inner_args: Vec<&str> = inner.arg_ranges.iter().map(|r| &src[r.clone()]).collect();
+        assert_eq!(inner_args, ["1", "2"]);
+    }
+
+    #[test]
+    fn comments_between_args_do_not_become_arguments() {
+        let src = "void u(void) { f(a /* why */, b); }\n";
+        let f = file_facts(src);
+        let call = f.calls.iter().find(|c| c.callee == "f").unwrap();
+        let args: Vec<&str> = call.arg_ranges.iter().map(|r| &src[r.clone()]).collect();
+        assert_eq!(args, ["a", "b"]);
     }
 
     #[test]
