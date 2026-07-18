@@ -1,0 +1,16 @@
+[package]
+name = "cauldron-dap"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Cauldron's DAP client: threads-not-tokio stdio transport, lldb-dap + debugpy, async handshake state machine."
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+log = { workspace = true }
+
+[[bin]]
+name = "fake-dap"
+path = "src/bin/fake_dap.rs"

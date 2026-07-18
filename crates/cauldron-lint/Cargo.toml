@@ -1,0 +1,19 @@
+[package]
+name = "cauldron-lint"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "NASA/JPL Power-of-Ten enforcement: tree-sitter analyzer + clang-tidy/cppcheck adapters, unified diagnostics. Lib + CLI, no GUI deps."
+
+[[bin]]
+name = "cauldron-lint"
+path = "src/main.rs"
+
+[dependencies]
+tree-sitter = "0.22"
+tree-sitter-c = "0.21"
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+cauldron-psi = { path = "../cauldron-psi" }

@@ -1,0 +1,37 @@
+[package]
+name = "cauldron-editor"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Cauldron's text engine: rope buffer + incremental tree-sitter + a viewport-virtualized egui widget."
+
+[dependencies]
+egui = { workspace = true }
+ropey = "1.6"
+regex = "1"
+# tree-sitter core + grammars are ONE version set (ABI must align) — never bump one alone.
+tree-sitter = "0.22"
+tree-sitter-c = "0.21"
+tree-sitter-rust = "0.21"
+tree-sitter-cpp = "0.22"
+tree-sitter-python = "0.21"
+tree-sitter-javascript = "0.21"
+tree-sitter-typescript = "0.21"
+tree-sitter-css = "0.21"
+tree-sitter-html = "0.20"
+tree-sitter-c-sharp = "0.21"
+tree-sitter-json = "0.21"
+tree-sitter-yaml = "0.6"
+tree-sitter-java = "0.21"
+unicode-segmentation = "1"
+unicode-width = "0.1"
+log = { workspace = true }
+
+[dev-dependencies]
+# Gate-A benches run headless: cargo bench -p cauldron-editor
+criterion = "0.5"
+
+[[bench]]
+name = "keystroke"
+harness = false

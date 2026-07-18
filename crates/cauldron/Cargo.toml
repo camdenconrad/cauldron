@@ -1,0 +1,46 @@
+[package]
+name = "cauldron"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Cauldron — a Rune-native IDE (egui/wgpu): RustRover-style shell, LSP, Claude Code host, NASA Power-of-Ten enforcement."
+
+[[bin]]
+name = "cauldron"
+path = "src/main.rs"
+
+[dependencies]
+eframe = { workspace = true }
+egui = { workspace = true }
+cauldron-dap = { path = "../cauldron-dap" }
+cauldron-editor = { path = "../cauldron-editor" }
+cauldron-lint = { path = "../cauldron-lint" }
+cauldron-lsp = { path = "../cauldron-lsp" }
+cauldron-psi = { path = "../cauldron-psi" }
+# The Rune terminal as a library — the embedded terminal pane (side-by-side checkout).
+cider = { package = "livewall-cider", path = "../cider" }
+ropey = "1.6"
+# Shared Rune theme/chrome from the side-by-side livewall-studio checkout.
+livewall-uikit = { path = "../livewall-uikit" }
+anyhow = { workspace = true }
+log = { workspace = true }
+env_logger = "0.11"
+# workspace walking for the file tree + quick-open (gitignore-respecting)
+ignore = "0.4"
+# file watcher: external changes (git checkout, codegen) invalidate tree/symbols/PSI (watcher.rs)
+notify = { workspace = true }
+# fuzzy matching for Ctrl+P quick-open / palette
+nucleo-matcher = "0.3"
+# repo-search Regex mode + the pragmatic per-language symbol extractors (symbols.rs)
+regex = "1"
+serde = { workspace = true }
+serde_json = { workspace = true }
+# PNG decoding for the embedded toolbar icon textures (SVG masters in assets/toolbar/)
+image = { version = "0.25", default-features = false, features = ["png"] }
+
+[dev-dependencies]
+# Tests only: parse the Cargo.toml the New Project templates GENERATE, so a path needing TOML
+# escaping (a quote/backslash in the project's parent dir) is caught as a parse failure rather
+# than by eyeballing the emitted string.
+toml = "0.8"

@@ -1,0 +1,40 @@
+[package]
+name = "livewall-cider"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "cider — a native Rust/wgpu terminal emulator for Rune (alacritty_terminal + portable-pty + egui)."
+
+[lib]
+name = "cider"
+path = "src/lib.rs"
+
+[[bin]]
+name = "cider"
+path = "src/main.rs"
+
+[dependencies]
+eframe = { version = "0.29.1", default-features = false, features = ["wgpu", "default_fonts", "wayland", "x11"] }
+egui = "0.29.1"
+livewall-uikit = { path = "../livewall-uikit" }
+# Terminal engine: VTE parser + grid/scrollback state machine (the same core Alacritty ships).
+alacritty_terminal = "0.24"
+# Spawn $SHELL on a real PTY and pump bytes both ways.
+portable-pty = "0.8"
+# On-demand clipboard reads for Shift+Insert / middle-click / right-click paste (egui only surfaces
+# clipboard text via its Ctrl+V Paste event). Under Rune an ordinary client may only bind the
+# focus-gated core wl_data_device (data-control is reserved for rclip), which is smithay-clipboard's
+# path — see src/clip.rs. arboard remains the X11 fallback.
+smithay-clipboard = "0.7"
+raw-window-handle = "0.6"
+arboard = "3"
+# Colour emoji: ttf-parser pulls the PNG strikes out of NotoColorEmoji's CBDT table, image decodes
+# them into RGBA for egui textures (same pipeline Luna ships in crates/luna/src/ui/emoji.rs).
+ttf-parser = "0.24"
+image = { version = "0.25", default-features = false, features = ["png"] }
+serde = { workspace = true }
+toml = "0.8"
+anyhow = { workspace = true }
+log = "0.4"
+env_logger = "0.11"

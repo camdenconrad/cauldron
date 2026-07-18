@@ -1,0 +1,5 @@
+/target
+**/*.rs.bk
+
+# Cauldron per-project state (run configs, layout, local history)
+/.cauldron

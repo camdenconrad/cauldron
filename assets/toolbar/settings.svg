@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none"
+     stroke="#9C978C" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+  <!-- Settings: toothed gear sized to the family's optical weight (tips r7.5 vs magnifier r5.8+handle). -->
+  <path d="M10.48 6.82 L10.77 4.60 L13.23 4.60 L13.52 6.82 A5.40 5.40 0 0 1 14.59 7.26 L16.36 5.90 L18.10 7.64 L16.74 9.41 A5.40 5.40 0 0 1 17.18 10.48 L19.40 10.77 L19.40 13.23 L17.18 13.52 A5.40 5.40 0 0 1 16.74 14.59 L18.10 16.36 L16.36 18.10 L14.59 16.74 A5.40 5.40 0 0 1 13.52 17.18 L13.23 19.40 L10.77 19.40 L10.48 17.18 A5.40 5.40 0 0 1 9.41 16.74 L7.64 18.10 L5.90 16.36 L7.26 14.59 A5.40 5.40 0 0 1 6.82 13.52 L4.60 13.23 L4.60 10.77 L6.82 10.48 A5.40 5.40 0 0 1 7.26 9.41 L5.90 7.64 L7.64 5.90 L9.41 7.26 Z"/>
+  <circle cx="12" cy="12" r="2.3"/>
+</svg>

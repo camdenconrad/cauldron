@@ -1,0 +1,14 @@
+[package]
+name = "livewall-uikit"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Shared egui look-and-feel for Rune's native apps: the autumn theme + window chrome, so redit/rmon/rpower/rark/lull share one modern visual identity."
+
+[lib]
+name = "livewall_uikit"
+path = "src/lib.rs"
+
+[dependencies]
+egui = "0.29.1"

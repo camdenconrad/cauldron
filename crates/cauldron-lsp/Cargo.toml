@@ -1,0 +1,24 @@
+[package]
+name = "cauldron-lsp"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Cauldron's LSP client: threads-not-tokio stdio transport, clangd + rust-analyzer, Transaction-derived incremental didChange."
+
+[dependencies]
+cauldron-editor = { path = "../cauldron-editor" }
+ropey = "1.6"
+# EXACT pin — 0.95.1 has LSP-3.17 positionEncoding AND still re-exports url::Url with
+# from_file_path/to_file_path; 0.96+ switched to a fluent-uri Uri with NO file-path conversion.
+# rust-analyzer itself pins =0.95.1 for the same reason. Do NOT let this float.
+lsp-types = "=0.95.1"
+serde = { workspace = true }
+serde_json = { workspace = true }
+log = { workspace = true }
+
+[[bin]]
+name = "fake-lsp"
+path = "src/bin/fake_lsp.rs"
+
+[dev-dependencies]
