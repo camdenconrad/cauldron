@@ -742,8 +742,11 @@ struct App {
     fix_menu: Option<(egui::Pos2, PathBuf, Vec<lsp_types::CodeActionOrCommand>)>,
     /// Heading for `fix_menu` — the same popup serves Quick Fixes and Refactor This.
     fix_menu_title: &'static str,
-    /// The Change Signature dialog (Ctrl+F6), when open. C only — it is driven by the PSI index.
+    /// The Change Signature dialog (Ctrl+F6), when open.
     chsig: Option<chsig_ui::ChangeSigUi>,
+    /// Generation of the in-flight rust-analyzer references request backing the dialog. Kept
+    /// separate from `usages_gen` so the reply fills the dialog instead of the Usages panel.
+    chsig_refs_gen: Option<u64>,
     /// True while the in-flight code-action request was `only: ["refactor", …]`, so the reply
     /// opens as Refactor This (grouped, with the built-in Rename entry) rather than Quick Fixes.
     fix_request_refactor: bool,
@@ -1013,6 +1016,7 @@ impl App {
             fix_menu: None,
             fix_menu_title: "Quick Fixes",
             chsig: None,
+            chsig_refs_gen: None,
             fix_request_refactor: false,
             git_panel: GitPanel::default(),
             goto_line: None,
@@ -3912,6 +3916,13 @@ impl App {
                 None
             }
             LspEvent::References { generation, locations } => {
+                // The Change Signature dialog issues its own references request; that reply
+                // belongs to the dialog, not the Usages panel.
+                if self.chsig_refs_gen == Some(generation) && self.chsig.is_some() {
+                    self.chsig_refs_gen = None;
+                    self.chsig_take_references(&locations);
+                    return None;
+                }
                 if self.usages_gen == Some(generation) {
                     self.usages_gen = None;
                     self.lsp_message = None;
@@ -4190,7 +4201,7 @@ impl App {
                         }
                         ui.close_menu();
                     }
-                    if self.psi.index().is_some()
+                    if self.change_signature_available()
                         && ui
                             .button("Change Signature…    Ctrl+F6")
                             .clicked_by(egui::PointerButton::Primary)
@@ -5256,16 +5267,35 @@ impl App {
         }
     }
 
-    /// Ctrl+F6 — open Change Signature for the function at the caret. C only: it is driven by
-    /// the PSI index, which is the only thing in the build that knows every call site's argument
-    /// spans (clangd does not implement this refactoring at all).
+    /// Is Change Signature offerable for the active file? C needs the PSI index; Rust needs
+    /// only a language server, since rust-analyzer supplies the reference set.
+    fn change_signature_available(&self) -> bool {
+        let g = &self.groups[self.focused];
+        match g.files.get(g.active).and_then(|f| f.lang) {
+            Some(cauldron_editor::syntax::Lang::Rust) => true,
+            Some(cauldron_editor::syntax::Lang::C) => self.psi.index().is_some(),
+            _ => false,
+        }
+    }
+
+    /// Ctrl+F6 — open Change Signature for the function at the caret.
+    ///
+    /// Two engines, because the languages need different machinery. C is driven by the PSI
+    /// index, which knows every call site by name. Rust cannot be: `new`/`len`/`run` are reused
+    /// across unrelated types and `x.foo(a)` needs type inference to resolve, so the reference
+    /// set comes from rust-analyzer and only the SPANS are parsed locally.
     fn start_change_signature(&mut self) {
         let Some(f) = self.groups[self.focused].active_file() else { return };
         let (path, byte) = (f.path.clone(), f.view.caret_byte());
         let text = f.buffer.rope().to_string();
+        let is_rust = matches!(f.lang, Some(cauldron_editor::syntax::Lang::Rust));
+        if is_rust {
+            self.start_change_signature_rust(path, byte, text);
+            return;
+        }
         let Some(index) = self.psi.index() else {
             self.lsp_message =
-                Some("Change Signature needs the C index (this is a C-only refactoring)".into());
+                Some("Change Signature needs the C index or a Rust language server".into());
             return;
         };
         let Some(name) = cauldron_psi::chsig::function_at(&index, &path, byte) else {
@@ -5283,10 +5313,64 @@ impl App {
             })
             .unwrap_or_default();
         self.close_overlays();
-        self.chsig = Some(chsig_ui::ChangeSigUi::new(name, path, params));
+        self.chsig = Some(chsig_ui::ChangeSigUi::new(chsig_ui::Engine::C, name, path, params));
     }
 
-    /// Current text of `path` for refactoring: the live buffer when the file is open and loaded
+    /// Rust path: seed the dialog from the local parse, then ask rust-analyzer for every
+    /// reference. The dialog opens immediately in a "finding references" state so the user is
+    /// not left staring at nothing while r-a answers.
+    fn start_change_signature_rust(&mut self, path: PathBuf, byte: usize, text: String) {
+        let Some((name, params)) = cauldron_psi::rustsig::current_params(&text, byte) else {
+            self.lsp_message = Some("put the caret on a function, method, or one of its calls".into());
+            return;
+        };
+        let Some(f) =
+            self.groups.iter().flat_map(|g| g.files.iter()).find(|f| f.path == path && f.loaded)
+        else {
+            return;
+        };
+        let (gen, rope) = (f.buffer.generation, f.buffer.rope().clone());
+        self.close_overlays();
+        self.chsig = Some(chsig_ui::ChangeSigUi::new(
+            chsig_ui::Engine::Rust(None),
+            name,
+            path.clone(),
+            params,
+        ));
+        // Reuse the references request; the dedicated generation keeps the reply from also
+        // populating the Usages panel.
+        self.chsig_refs_gen = Some(gen);
+        self.lsp.request_references(&path, &rope, byte, gen);
+    }
+
+    /// Turn rust-analyzer's reference Locations into byte offsets in each file's CURRENT text,
+    /// then hand them to the open dialog. Positions are in the server's negotiated encoding, and
+    /// a file that is open and dirty must be measured against the buffer, not the disk copy.
+    fn chsig_take_references(&mut self, locations: &[lsp_types::Location]) {
+        let mut refs: Vec<cauldron_psi::rustsig::Reference> = Vec::new();
+        let mut texts: HashMap<PathBuf, String> = HashMap::new();
+        for loc in locations {
+            let Some(path) = cauldron_lsp::capabilities::uri_to_path(&loc.uri) else { continue };
+            let enc = self.lsp_encoding(&path);
+            let text = match texts.get(&path) {
+                Some(t) => t.clone(),
+                None => {
+                    let Some(t) = self.text_for_refactor(&path) else { continue };
+                    texts.insert(path.clone(), t.clone());
+                    t
+                }
+            };
+            let rope = Rope::from_str(&text);
+            let offset = pos_to_byte(&rope, &loc.range.start, enc);
+            refs.push(cauldron_psi::rustsig::Reference { path, offset });
+        }
+        if let Some(d) = &mut self.chsig {
+            d.engine = chsig_ui::Engine::Rust(Some(refs));
+            d.mark_dirty();
+        }
+    }
+
+    /// Current text of `path` for refactoring:    /// Current text of `path` for refactoring: the live buffer when the file is open and loaded
     /// (the PSI index carries buffer-coordinate overlay facts for dirty files, so spans and text
     /// must come from the same place), otherwise disk.
     fn text_for_refactor(&self, path: &Path) -> Option<String> {
@@ -5306,28 +5390,39 @@ impl App {
         // Recompute the preview before drawing, so the counts on screen match the current rows.
         if self.chsig.as_ref().is_some_and(chsig_ui::ChangeSigUi::needs_preview) {
             let change = self.chsig.as_ref().map(chsig_ui::ChangeSigUi::change);
-            if let (Some(change), Some(index)) = (change, self.psi.index()) {
-                // Anchor on the file the refactoring was invoked in, so a `static` resolves to
-                // the function under the caret rather than a same-named one elsewhere.
-                let from = self.chsig.as_ref().map(|d| d.path.clone());
-                let preview = cauldron_psi::chsig::plan_from(
-                    &index,
-                    &change,
-                    from.as_deref(),
-                    |p| self.text_for_refactor(p),
-                )
-                .map_err(|e| e.message());
-                if let Some(ui) = &mut self.chsig {
-                    ui.set_preview(preview);
-                }
+            let engine = self.chsig.as_ref().map(|d| d.engine.clone());
+            let from = self.chsig.as_ref().map(|d| d.path.clone());
+            let preview = match (change, engine) {
+                (Some(change), Some(chsig_ui::Engine::C)) => self.psi.index().map(|index| {
+                    // Anchor on the invoking file so a `static` resolves to the function under
+                    // the caret rather than a same-named one elsewhere.
+                    cauldron_psi::chsig::plan_from(&index, &change, from.as_deref(), |p| {
+                        self.text_for_refactor(p)
+                    })
+                    .map_err(|e| e.message())
+                }),
+                // Still waiting on rust-analyzer — leave the dialog in its pending state.
+                (_, Some(chsig_ui::Engine::Rust(None))) => None,
+                (Some(change), Some(chsig_ui::Engine::Rust(Some(refs)))) => Some(
+                    cauldron_psi::rustsig::plan(&refs, &change, |p| self.text_for_refactor(p))
+                        .map_err(|e| e.message()),
+                ),
+                _ => None,
+            };
+            if let (Some(preview), Some(ui)) = (preview, &mut self.chsig) {
+                ui.set_preview(preview);
             }
         }
         let Some(dialog) = &mut self.chsig else { return };
         match dialog.ui(ctx) {
             chsig_ui::Action::None => {}
-            chsig_ui::Action::Close => self.chsig = None,
+            chsig_ui::Action::Close => {
+                self.chsig = None;
+                self.chsig_refs_gen = None;
+            }
             chsig_ui::Action::Apply(plan, change) => {
                 self.chsig = None;
+                self.chsig_refs_gen = None;
                 self.apply_signature_plan(&plan, &change.function);
             }
         }
@@ -8462,7 +8557,7 @@ impl eframe::App for App {
                             }
                             // Change Signature is ours (PSI-driven) — no C language server
                             // implements it, so it never appears among the server's actions.
-                            if self.psi.index().is_some()
+                            if self.change_signature_available()
                                 && ui
                                     .selectable_label(
                                         false,

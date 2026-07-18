@@ -20,4 +20,5 @@ pub mod index;
 pub mod invalidate;
 pub mod project;
 pub mod query;
+pub mod rustsig;
 pub mod tu;

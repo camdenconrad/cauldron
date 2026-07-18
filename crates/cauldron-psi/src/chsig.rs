@@ -105,6 +105,12 @@ pub enum Warning {
     UnspannedDeclaration { path: PathBuf, line: usize },
     /// A file named in the index whose text the provider could not supply.
     UnreadableFile { path: PathBuf },
+    /// A reference the rewriter could not interpret as either a call or a declaration — a
+    /// macro-generated use, a re-export, or a syntax shape the parser does not model.
+    UnresolvedReference { path: PathBuf, offset: usize },
+    /// The function is referenced by VALUE (`let f = foo;`, passed as a callback) rather than
+    /// called. Its type still names the old signature, and no call-site rewrite fixes that.
+    FunctionValueReference { path: PathBuf, offset: usize },
 }
 
 impl Warning {
@@ -130,6 +136,14 @@ impl Warning {
                 line + 1
             ),
             Self::UnreadableFile { path } => format!("{}: could not read", path.display()),
+            Self::UnresolvedReference { path, offset } => format!(
+                "{} @{offset}: reference is neither a call nor a declaration — review by hand",
+                path.display()
+            ),
+            Self::FunctionValueReference { path, offset } => format!(
+                "{} @{offset}: used as a value, not called — its function type still has the old signature",
+                path.display()
+            ),
         }
     }
 }
@@ -439,7 +453,7 @@ fn render_params(ops: &[ParamOp], old: &[&str]) -> String {
 }
 
 /// Render the new argument list body (no enclosing parens) for one call site.
-fn render_args(ops: &[ParamOp], old: &[&str]) -> String {
+pub(crate) fn render_args(ops: &[ParamOp], old: &[&str]) -> String {
     ops.iter()
         .map(|op| match op {
             ParamOp::Keep { from, .. } => old.get(*from).copied().unwrap_or("").trim().to_string(),

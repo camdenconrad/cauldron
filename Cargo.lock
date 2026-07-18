@@ -489,6 +489,7 @@ dependencies = [
  "serde_json",
  "tree-sitter",
  "tree-sitter-c",
+ "tree-sitter-rust",
 ]
 
 [[package]]

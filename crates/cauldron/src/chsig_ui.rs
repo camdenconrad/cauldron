@@ -11,7 +11,19 @@
 //! which silently moves keyboard focus to the wrong text box.
 
 use cauldron_psi::chsig::{ParamOp, Plan, SignatureChange};
+use cauldron_psi::rustsig;
 use std::path::PathBuf;
+
+/// Which engine plans this change. C is index-driven ([`cauldron_psi::chsig`]); Rust is driven by
+/// rust-analyzer's reference set ([`cauldron_psi::rustsig`]) because a name-keyed Rust index
+/// would resolve the wrong `new`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Engine {
+    C,
+    /// References from rust-analyzer, as (file, byte offset of the name token). `None` while the
+    /// request is still in flight.
+    Rust(Option<Vec<rustsig::Reference>>),
+}
 
 use crate::style;
 
@@ -36,6 +48,7 @@ pub enum Action {
 }
 
 pub struct ChangeSigUi {
+    pub engine: Engine,
     pub function: String,
     /// The file the caret was in — the anchor for resolving which `static` is meant.
     pub path: PathBuf,
@@ -50,13 +63,14 @@ pub struct ChangeSigUi {
 }
 
 impl ChangeSigUi {
-    pub fn new(function: String, path: PathBuf, params: Vec<String>) -> Self {
+    pub fn new(engine: Engine, function: String, path: PathBuf, params: Vec<String>) -> Self {
         let rows = params
             .iter()
             .enumerate()
             .map(|(i, p)| Row { from: Some(i), text: p.clone(), default_arg: String::new() })
             .collect();
         Self {
+            engine,
             function,
             path,
             rows,
@@ -94,6 +108,11 @@ impl ChangeSigUi {
         }
     }
 
+    /// Force the next frame to recompute the preview — used when the reference set arrives.
+    pub fn mark_dirty(&mut self) {
+        self.dirty = true;
+    }
+
     /// Has the intent changed since the last [`Self::set_preview`]?
     pub fn needs_preview(&self) -> bool {
         self.dirty
@@ -117,7 +136,11 @@ impl ChangeSigUi {
     fn signature_line(&self) -> String {
         let params: Vec<&str> = self.rows.iter().map(|r| r.text.trim()).collect();
         if params.is_empty() {
-            format!("{}(void)", self.function)
+            // C spells "no parameters" as `(void)`; in Rust that is just `()`.
+            match self.engine {
+                Engine::C => format!("{}(void)", self.function),
+                Engine::Rust(_) => format!("{}()", self.function),
+            }
         } else {
             format!("{}({})", self.function, params.join(", "))
         }
@@ -262,6 +285,13 @@ impl ChangeSigUi {
                                     }
                                 });
                         }
+                    }
+                    (None, None) if matches!(self.engine, Engine::Rust(None)) => {
+                        ui.label(
+                            egui::RichText::new("finding references (rust-analyzer)…")
+                                .size(12.0)
+                                .color(style::colors::TEXT_MUTED()),
+                        );
                     }
                     (None, None) => {
                         ui.label(
