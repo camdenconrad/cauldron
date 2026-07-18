@@ -193,6 +193,20 @@ impl Plan {
 pub fn plan(
     index: &Index,
     change: &SignatureChange,
+    text_of: impl FnMut(&Path) -> Option<String>,
+) -> Result<Plan, PlanError> {
+    plan_from(index, change, None, text_of)
+}
+
+/// As [`plan`], but anchored at `from_file` — the file the user invoked the refactoring in.
+///
+/// This matters only for `static` functions, where two files can define DIFFERENT functions with
+/// the same name. Without an anchor the first definition in index order wins, which may not be
+/// the one under the caret; the refactoring would then silently rewrite the wrong file.
+pub fn plan_from(
+    index: &Index,
+    change: &SignatureChange,
+    from_file: Option<&Path>,
     mut text_of: impl FnMut(&Path) -> Option<String>,
 ) -> Result<Plan, PlanError> {
     let name = change.function.as_str();
@@ -204,10 +218,18 @@ pub fn plan(
 
     // Anchor on a definition when there is one — a prototype can be K&R while the definition is
     // fully spelled. Macros and typedefs are not functions and must not be rewritten.
-    let anchor = defs
-        .iter()
-        .chain(decls.iter())
-        .find_map(|&d| index.stub(d).map(|s| (d, s)))
+    // Prefer a definition in the invoking file: with two same-named statics, that is the only
+    // thing distinguishing the one the user meant from an unrelated function elsewhere.
+    let anchor_fid = from_file.and_then(|p| index.file_id(p));
+    let pick = |want: Option<crate::graph::FileId>| {
+        defs.iter()
+            .chain(decls.iter())
+            .filter(|d| want.is_none_or(|w| d.file == w))
+            .find_map(|&d| index.stub(d).map(|s| (d, s)))
+    };
+    let anchor = anchor_fid
+        .and_then(|f| pick(Some(f)))
+        .or_else(|| pick(None))
         .ok_or_else(|| PlanError::NotFound(name.to_string()))?;
     if !matches!(anchor.1.kind, StubKind::FnDef | StubKind::FnDecl) {
         return Err(PlanError::NotAFunction(name.to_string()));
@@ -572,6 +594,31 @@ void u(void) { f(7); }
         assert_eq!(plan.files_touched(), 1);
         let out = apply(&plan, &texts);
         assert_eq!(out[&PathBuf::from("/p/b.c")], b, "the other file's static is untouched");
+        assert!(out[&PathBuf::from("/p/a.c")].contains("helper(int y, int x)"));
+    }
+
+    #[test]
+    fn anchor_file_picks_the_right_static_of_two_with_the_same_name() {
+        // Both files define a DIFFERENT static `helper`. Which one gets refactored must follow
+        // the file the user invoked from, not index order.
+        let a = "static int helper(int x, int y) { return x; }\nvoid ua(void) { helper(1, 2); }\n";
+        let b = "static int helper(int x, int y) { return y; }\nvoid ub(void) { helper(3, 4); }\n";
+        let (index, texts) = index_of(&[("/p/a.c", a), ("/p/b.c", b)]);
+        let change = SignatureChange { function: "helper".into(), params: vec![keep(1), keep(0)] };
+
+        let from_b =
+            plan_from(&index, &change, Some(Path::new("/p/b.c")), |p| texts.get(p).cloned())
+                .unwrap();
+        assert_eq!(from_b.files.iter().filter(|f| !f.edits.is_empty()).count(), 1);
+        let out = apply(&from_b, &texts);
+        assert_eq!(out[&PathBuf::from("/p/a.c")], a, "a.c untouched when invoked from b.c");
+        assert!(out[&PathBuf::from("/p/b.c")].contains("helper(int y, int x)"));
+
+        let from_a =
+            plan_from(&index, &change, Some(Path::new("/p/a.c")), |p| texts.get(p).cloned())
+                .unwrap();
+        let out = apply(&from_a, &texts);
+        assert_eq!(out[&PathBuf::from("/p/b.c")], b, "b.c untouched when invoked from a.c");
         assert!(out[&PathBuf::from("/p/a.c")].contains("helper(int y, int x)"));
     }
 

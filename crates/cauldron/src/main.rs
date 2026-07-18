@@ -13,6 +13,7 @@ mod ai_actions;
 mod boot_trace;
 mod conflicts;
 mod checklist;
+mod chsig_ui;
 mod coverage;
 mod deps;
 mod blame;
@@ -741,6 +742,8 @@ struct App {
     fix_menu: Option<(egui::Pos2, PathBuf, Vec<lsp_types::CodeActionOrCommand>)>,
     /// Heading for `fix_menu` — the same popup serves Quick Fixes and Refactor This.
     fix_menu_title: &'static str,
+    /// The Change Signature dialog (Ctrl+F6), when open. C only — it is driven by the PSI index.
+    chsig: Option<chsig_ui::ChangeSigUi>,
     /// True while the in-flight code-action request was `only: ["refactor", …]`, so the reply
     /// opens as Refactor This (grouped, with the built-in Rename entry) rather than Quick Fixes.
     fix_request_refactor: bool,
@@ -1009,6 +1012,7 @@ impl App {
             fix_request_gen: None,
             fix_menu: None,
             fix_menu_title: "Quick Fixes",
+            chsig: None,
             fix_request_refactor: false,
             git_panel: GitPanel::default(),
             goto_line: None,
@@ -4186,6 +4190,14 @@ impl App {
                         }
                         ui.close_menu();
                     }
+                    if self.psi.index().is_some()
+                        && ui
+                            .button("Change Signature…    Ctrl+F6")
+                            .clicked_by(egui::PointerButton::Primary)
+                    {
+                        self.start_change_signature();
+                        ui.close_menu();
+                    }
                     if ui.button("Go to Implementation    Ctrl+Alt+B").clicked_by(egui::PointerButton::Primary) {
                         if let Some(f) = self.groups[self.focused].active_file() {
                             let (path, gen, byte) =
@@ -5241,6 +5253,167 @@ impl App {
             self.fix_request_refactor = false;
             self.lsp.request_code_actions(&path, &rope, range, gen);
             self.lsp_message = Some("fetching quick fixes…".into());
+        }
+    }
+
+    /// Ctrl+F6 — open Change Signature for the function at the caret. C only: it is driven by
+    /// the PSI index, which is the only thing in the build that knows every call site's argument
+    /// spans (clangd does not implement this refactoring at all).
+    fn start_change_signature(&mut self) {
+        let Some(f) = self.groups[self.focused].active_file() else { return };
+        let (path, byte) = (f.path.clone(), f.view.caret_byte());
+        let text = f.buffer.rope().to_string();
+        let Some(index) = self.psi.index() else {
+            self.lsp_message =
+                Some("Change Signature needs the C index (this is a C-only refactoring)".into());
+            return;
+        };
+        let Some(name) = cauldron_psi::chsig::function_at(&index, &path, byte) else {
+            self.lsp_message = Some("put the caret on a function or one of its calls".into());
+            return;
+        };
+        // Seed from wherever the parameter list actually lives: the caret may be on a CALL, in
+        // which case this file may hold no declaration of the function at all.
+        let params = cauldron_psi::chsig::current_params(&index, &name, &text, &path)
+            .or_else(|| {
+                let d = *index.defs_by_name(&name).first().or(index.decls_by_name(&name).first())?;
+                let decl_path = index.path(d.file)?.to_path_buf();
+                let decl_text = self.text_for_refactor(&decl_path)?;
+                cauldron_psi::chsig::current_params(&index, &name, &decl_text, &decl_path)
+            })
+            .unwrap_or_default();
+        self.close_overlays();
+        self.chsig = Some(chsig_ui::ChangeSigUi::new(name, path, params));
+    }
+
+    /// Current text of `path` for refactoring: the live buffer when the file is open and loaded
+    /// (the PSI index carries buffer-coordinate overlay facts for dirty files, so spans and text
+    /// must come from the same place), otherwise disk.
+    fn text_for_refactor(&self, path: &Path) -> Option<String> {
+        self.groups
+            .iter()
+            .flat_map(|g| g.files.iter())
+            .find(|f| f.path == path && f.loaded)
+            .map(|f| f.buffer.rope().to_string())
+            .or_else(|| std::fs::read_to_string(path).ok())
+    }
+
+    /// Draw the Change Signature dialog, refresh its preview, and apply on Refactor.
+    fn change_signature_ui(&mut self, ctx: &egui::Context) {
+        if self.chsig.is_none() {
+            return;
+        }
+        // Recompute the preview before drawing, so the counts on screen match the current rows.
+        if self.chsig.as_ref().is_some_and(chsig_ui::ChangeSigUi::needs_preview) {
+            let change = self.chsig.as_ref().map(chsig_ui::ChangeSigUi::change);
+            if let (Some(change), Some(index)) = (change, self.psi.index()) {
+                // Anchor on the file the refactoring was invoked in, so a `static` resolves to
+                // the function under the caret rather than a same-named one elsewhere.
+                let from = self.chsig.as_ref().map(|d| d.path.clone());
+                let preview = cauldron_psi::chsig::plan_from(
+                    &index,
+                    &change,
+                    from.as_deref(),
+                    |p| self.text_for_refactor(p),
+                )
+                .map_err(|e| e.message());
+                if let Some(ui) = &mut self.chsig {
+                    ui.set_preview(preview);
+                }
+            }
+        }
+        let Some(dialog) = &mut self.chsig else { return };
+        match dialog.ui(ctx) {
+            chsig_ui::Action::None => {}
+            chsig_ui::Action::Close => self.chsig = None,
+            chsig_ui::Action::Apply(plan, change) => {
+                self.chsig = None;
+                self.apply_signature_plan(&plan, &change.function);
+            }
+        }
+    }
+
+    /// Apply a Change Signature plan through the same undo-safe path as any other refactor.
+    fn apply_signature_plan(&mut self, plan: &cauldron_psi::chsig::Plan, name: &str) {
+        // The plan's byte offsets belong to the index generation it was computed against. If the
+        // index moved (a background reindex landed, or a buffer changed) they may now point at
+        // different text, and applying them would corrupt files.
+        if self.psi.index().is_some_and(|i| i.generation() != plan.generation) {
+            self.lsp_message =
+                Some("the index changed while the dialog was open — reopen Change Signature".into());
+            return;
+        }
+        // 0.0 matches the other external-edit paths: a refactor never coalesces into a typing
+        // group, so the timestamp is immaterial.
+        let now = 0.0;
+        let (mut files, mut edits) = (0usize, 0usize);
+        let mut failures: Vec<String> = Vec::new();
+        for fe in &plan.files {
+            if fe.edits.is_empty() {
+                continue;
+            }
+            files += 1;
+            edits += fe.edits.len();
+            if let Err(e) = self.apply_psi_edits(&fe.path, &fe.edits, now) {
+                failures.push(e);
+            }
+        }
+        if failures.is_empty() {
+            self.lsp_message = Some(format!(
+                "changed signature of `{name}` — {edits} edit(s) across {files} file(s)"
+            ));
+        } else {
+            log::warn!("change signature failures: {}", failures.join("; "));
+            self.lsp_message =
+                Some(format!("change signature partly failed — {}", failures[0]));
+        }
+        self.refresh_nasa_squiggles();
+    }
+
+    /// Apply PSI byte edits (already DESCENDING) to one file — editor transaction when open,
+    /// local-history-backed disk write otherwise. Mirrors [`Self::apply_text_edits`], but PSI
+    /// edits are raw byte offsets and need no encoding conversion.
+    fn apply_psi_edits(
+        &mut self,
+        path: &Path,
+        edits: &[cauldron_psi::chsig::Edit],
+        now: f64,
+    ) -> Result<(), String> {
+        let open = self
+            .groups
+            .iter_mut()
+            .flat_map(|g| g.files.iter_mut())
+            .find(|f| f.path == path && f.loaded);
+        match open {
+            Some(f) => {
+                // Transaction wants ASCENDING disjoint changes; the plan is descending.
+                let mut changes: Vec<cauldron_editor::buffer::Change> = edits
+                    .iter()
+                    .map(|e| cauldron_editor::buffer::Change {
+                        start: e.range.start,
+                        end: e.range.end,
+                        text: e.text.clone(),
+                    })
+                    .collect();
+                changes.sort_by_key(|c| c.start);
+                let tx = cauldron_editor::Transaction { changes };
+                f.view.apply_external(&mut f.buffer, &tx, now);
+                f.dirty = true;
+                Ok(())
+            }
+            None => {
+                let text = std::fs::read_to_string(path)
+                    .map_err(|e| format!("{}: {e}", path.display()))?;
+                localhist::record(path, &text);
+                let mut out = text;
+                for e in edits {
+                    if e.range.end > out.len() || !out.is_char_boundary(e.range.start) {
+                        return Err(format!("{}: stale offsets, file changed", path.display()));
+                    }
+                    out.replace_range(e.range.clone(), &e.text);
+                }
+                std::fs::write(path, out).map_err(|e| format!("{}: {e}", path.display()))
+            }
         }
     }
 
@@ -6946,6 +7119,10 @@ impl eframe::App for App {
         if !shell && ctx.input(|i| i.modifiers.shift && i.key_pressed(egui::Key::F6)) {
             self.start_rename();
         }
+        // Ctrl+F6 — Change Signature (JetBrains' binding).
+        if !shell && ctx.input(|i| i.modifiers.command && i.key_pressed(egui::Key::F6)) {
+            self.start_change_signature();
+        }
         if !shell && ctx.input(|i| i.modifiers.alt && i.key_pressed(egui::Key::F7)) {
             self.find_usages();
         }
@@ -8283,6 +8460,20 @@ impl eframe::App for App {
                                 self.start_rename();
                                 close_menu = true;
                             }
+                            // Change Signature is ours (PSI-driven) — no C language server
+                            // implements it, so it never appears among the server's actions.
+                            if self.psi.index().is_some()
+                                && ui
+                                    .selectable_label(
+                                        false,
+                                        egui::RichText::new("Change Signature…      Ctrl+F6")
+                                            .size(12.5),
+                                    )
+                                    .clicked_by(egui::PointerButton::Primary)
+                            {
+                                self.start_change_signature();
+                                close_menu = true;
+                            }
                             ui.separator();
                         }
                         let mut group_shown = "";
@@ -8454,6 +8645,7 @@ impl eframe::App for App {
         self.prompt_ui(ctx);
         self.close_confirm_ui(ctx);
         self.ai_edit_ui(ctx);
+        self.change_signature_ui(ctx);
         self.def_choices_ui(ctx);
         self.conflict_resolver_ui(ctx);
         self.recent_locations_ui(ctx);
