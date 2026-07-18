@@ -170,6 +170,15 @@ pub enum LspEvent {
         path: PathBuf,
         actions: Vec<lsp_types::CodeActionOrCommand>,
     },
+    /// A lazily-resolved code action come back with its `edit`/`command` filled in
+    /// ([`LspManager::resolve_code_action`]). Apply it exactly like a resolved-on-arrival one.
+    /// `action` is `None` when the server errored or sent something undecodable — the caller
+    /// should tell the user the refactor failed rather than silently doing nothing.
+    ResolvedCodeAction {
+        generation: u64,
+        path: PathBuf,
+        action: Option<Box<lsp_types::CodeAction>>,
+    },
     /// One server's answer to a `workspace/symbol` query ([`LspManager::request_workspace_symbols`]
     /// fans out to every indexed server, so several of these can arrive per query — merge them).
     /// 3.17 `WorkspaceSymbol` rows are normalized into flat `SymbolInformation` at decode time

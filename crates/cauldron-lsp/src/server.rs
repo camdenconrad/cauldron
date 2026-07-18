@@ -46,6 +46,7 @@ pub(crate) enum PendingKind {
     Definition { generation: u64 },
     Completion { generation: u64 },
     CodeAction { generation: u64, path: PathBuf },
+    ResolveCodeAction { generation: u64, path: PathBuf },
     Rename { generation: u64 },
     Formatting { generation: u64, path: PathBuf },
     References { generation: u64 },
@@ -405,6 +406,17 @@ fn route(
                     emit(events, notifier, id, Raw::InitFailed(m.to_string()));
                 }
                 PendingKind::Shutdown => emit(events, notifier, id, Raw::ShutdownAck),
+                // The user pressed a refactor and is waiting on it — a silent swallow here reads
+                // as "the IDE ignored me". Report the failure so the app can say so.
+                PendingKind::ResolveCodeAction { generation, path } => {
+                    log::warn!("lsp[{}] codeAction/resolve failed ({code}): {err}", id.0);
+                    emit(
+                        events,
+                        notifier,
+                        id,
+                        Raw::Lsp(LspEvent::ResolvedCodeAction { generation, path, action: None }),
+                    );
+                }
                 // ContentModified / ServerNotInitialized are expected races — swallow silently.
                 _ => {
                     if code != -32801 && code != -32002 {
@@ -437,6 +449,19 @@ fn route(
                     notifier,
                     id,
                     Raw::Lsp(LspEvent::CodeActions { generation, path, actions }),
+                );
+            }
+            PendingKind::ResolveCodeAction { generation, path } => {
+                // A resolve that comes back undecodable is a failed refactor, not a no-op —
+                // emit `None` so the app can say so instead of leaving the user guessing.
+                let action = serde_json::from_value::<lsp_types::CodeAction>(result)
+                    .ok()
+                    .map(Box::new);
+                emit(
+                    events,
+                    notifier,
+                    id,
+                    Raw::Lsp(LspEvent::ResolvedCodeAction { generation, path, action }),
                 );
             }
             PendingKind::Rename { generation } => {

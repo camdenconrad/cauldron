@@ -121,10 +121,24 @@ pub fn initialize_params(root: &Path, kind: ServerKind) -> Value {
                 "codeAction": {
                     "codeActionLiteralSupport": {
                         "codeActionKind": {
-                            "valueSet": ["quickfix", "refactor", "refactor.rewrite", "source"]
+                            // Servers intersect this set with what they can offer, so anything
+                            // missing here is a refactor we never get asked about. extract/inline
+                            // are where rust-analyzer and clangd keep the interesting ones.
+                            "valueSet": [
+                                "", "quickfix", "refactor", "refactor.extract",
+                                "refactor.inline", "refactor.rewrite", "refactor.move",
+                                "source", "source.organizeImports", "source.fixAll"
+                            ]
                         }
                     },
-                    "isPreferredSupport": true
+                    "isPreferredSupport": true,
+                    // rust-analyzer's extract/inline actions arrive with NO `edit` — just an
+                    // opaque `data` blob to hand back via codeAction/resolve. Without these two
+                    // flags the server either withholds `data` or refuses to defer at all, and
+                    // every such action silently no-ops when applied.
+                    "dataSupport": true,
+                    "resolveSupport": {"properties": ["edit", "command"]},
+                    "honorsChangeAnnotations": false
                 },
                 "documentSymbol": {
                     "hierarchicalDocumentSymbolSupport": true,
@@ -273,17 +287,32 @@ mod tests {
         );
         assert_eq!(caps["textDocument"]["inlayHint"]["dynamicRegistration"], false);
         assert_eq!(caps["workspace"]["workspaceEdit"]["failureHandling"], "abort");
-        assert_eq!(
-            caps["textDocument"]["codeAction"],
-            json!({
-                "codeActionLiteralSupport": {
-                    "codeActionKind": {
-                        "valueSet": ["quickfix", "refactor", "refactor.rewrite", "source"]
-                    }
-                },
-                "isPreferredSupport": true
-            })
-        );
+        let ca = &caps["textDocument"]["codeAction"];
+        assert_eq!(ca["isPreferredSupport"], true);
+        // dataSupport + resolveSupport are what let a server defer an action's edit to
+        // codeAction/resolve; without them rust-analyzer's extract/inline refactors arrive
+        // with no edit and applying one silently does nothing.
+        assert_eq!(ca["dataSupport"], true);
+        assert_eq!(ca["resolveSupport"], json!({"properties": ["edit", "command"]}));
+        // Servers intersect this set with what they offer — a kind missing here is a refactor
+        // we are never offered. extract/inline are the ones that matter most.
+        let kinds = ca["codeActionLiteralSupport"]["codeActionKind"]["valueSet"]
+            .as_array()
+            .expect("valueSet is an array")
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect::<Vec<_>>();
+        for required in [
+            "quickfix",
+            "refactor",
+            "refactor.extract",
+            "refactor.inline",
+            "refactor.rewrite",
+            "refactor.move",
+            "source",
+        ] {
+            assert!(kinds.contains(&required), "codeActionKind valueSet is missing {required}");
+        }
 
         // "symbolKind": {"valueSet":[1..26]} means the literal integers 1 through 26.
         let value_set = caps["textDocument"]["documentSymbol"]["symbolKind"]["valueSet"]

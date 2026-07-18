@@ -201,6 +201,134 @@ pub fn map_range_through_tx(
     Some(start..end)
 }
 
+/// One step of a `WorkspaceEdit`, in the order the server listed it.
+///
+/// Resource operations and text edits are ORDER-SENSITIVE with respect to each other — a
+/// "move module to its own file" refactor creates the file, edits it, then edits the original —
+/// so unlike [`workspace_edit_to_file_edits`] this preserves sequence instead of grouping by file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WorkspaceOp {
+    /// Text edits for one file, sorted DESCENDING (back-to-front application), same as
+    /// [`workspace_edit_to_file_edits`].
+    Edit { path: std::path::PathBuf, edits: Vec<lsp_types::TextEdit> },
+    Create { path: std::path::PathBuf, overwrite: bool, ignore_if_exists: bool },
+    Rename { from: std::path::PathBuf, to: std::path::PathBuf, overwrite: bool, ignore_if_exists: bool },
+    Delete { path: std::path::PathBuf, recursive: bool, ignore_if_not_exists: bool },
+}
+
+/// Flatten a `WorkspaceEdit` into ordered [`WorkspaceOp`]s, resource operations included.
+///
+/// This is the move/safe-delete-capable counterpart to [`workspace_edit_to_file_edits`], which
+/// drops resource ops and can therefore only express pure-text refactors. Non-`file://` uris are
+/// skipped with a log line. The legacy `changes` map has no resource ops and no meaningful order,
+/// so its entries are emitted first, sorted by path for determinism.
+/// PURE — no I/O, no server state.
+pub fn workspace_edit_to_ops(edit: &lsp_types::WorkspaceEdit) -> Vec<WorkspaceOp> {
+    let mut ops: Vec<WorkspaceOp> = Vec::new();
+
+    let sort_desc = |mut edits: Vec<lsp_types::TextEdit>| {
+        edits.sort_by_key(|e| (e.range.start.line, e.range.start.character));
+        edits.reverse();
+        edits
+    };
+
+    if let Some(changes) = &edit.changes {
+        let mut entries: Vec<(std::path::PathBuf, Vec<lsp_types::TextEdit>)> = changes
+            .iter()
+            .filter_map(|(uri, edits)| {
+                crate::capabilities::uri_to_path(uri)
+                    .or_else(|| {
+                        log::warn!("workspace edit targets non-file uri {uri}, skipped");
+                        None
+                    })
+                    .map(|p| (p, edits.clone()))
+            })
+            .collect();
+        entries.sort_by(|a, b| a.0.cmp(&b.0));
+        ops.extend(
+            entries.into_iter().map(|(path, edits)| WorkspaceOp::Edit { path, edits: sort_desc(edits) }),
+        );
+    }
+
+    let Some(doc_changes) = &edit.document_changes else { return ops };
+    let mut push_edit = |ops: &mut Vec<WorkspaceOp>, de: &lsp_types::TextDocumentEdit| {
+        let Some(path) = crate::capabilities::uri_to_path(&de.text_document.uri) else {
+            log::warn!("workspace edit targets non-file uri {}, skipped", de.text_document.uri);
+            return;
+        };
+        let edits = de
+            .edits
+            .iter()
+            .map(|e| match e {
+                lsp_types::OneOf::Left(edit) => edit.clone(),
+                lsp_types::OneOf::Right(annotated) => annotated.text_edit.clone(),
+            })
+            .collect();
+        ops.push(WorkspaceOp::Edit { path, edits: sort_desc(edits) });
+    };
+
+    match doc_changes {
+        lsp_types::DocumentChanges::Edits(edits) => {
+            for de in edits {
+                push_edit(&mut ops, de);
+            }
+        }
+        lsp_types::DocumentChanges::Operations(raw) => {
+            for op in raw {
+                match op {
+                    lsp_types::DocumentChangeOperation::Edit(de) => push_edit(&mut ops, de),
+                    lsp_types::DocumentChangeOperation::Op(rop) => match rop {
+                        lsp_types::ResourceOp::Create(c) => {
+                            if let Some(path) = crate::capabilities::uri_to_path(&c.uri) {
+                                let o = c.options.as_ref();
+                                ops.push(WorkspaceOp::Create {
+                                    path,
+                                    overwrite: o.and_then(|o| o.overwrite).unwrap_or(false),
+                                    ignore_if_exists: o
+                                        .and_then(|o| o.ignore_if_exists)
+                                        .unwrap_or(false),
+                                });
+                            }
+                        }
+                        lsp_types::ResourceOp::Rename(r) => {
+                            match (
+                                crate::capabilities::uri_to_path(&r.old_uri),
+                                crate::capabilities::uri_to_path(&r.new_uri),
+                            ) {
+                                (Some(from), Some(to)) => {
+                                    let o = r.options.as_ref();
+                                    ops.push(WorkspaceOp::Rename {
+                                        from,
+                                        to,
+                                        overwrite: o.and_then(|o| o.overwrite).unwrap_or(false),
+                                        ignore_if_exists: o
+                                            .and_then(|o| o.ignore_if_exists)
+                                            .unwrap_or(false),
+                                    });
+                                }
+                                _ => log::warn!("rename op with non-file uri skipped"),
+                            }
+                        }
+                        lsp_types::ResourceOp::Delete(d) => {
+                            if let Some(path) = crate::capabilities::uri_to_path(&d.uri) {
+                                let o = d.options.as_ref();
+                                ops.push(WorkspaceOp::Delete {
+                                    path,
+                                    recursive: o.and_then(|o| o.recursive).unwrap_or(false),
+                                    ignore_if_not_exists: o
+                                        .and_then(|o| o.ignore_if_not_exists)
+                                        .unwrap_or(false),
+                                });
+                            }
+                        }
+                    },
+                }
+            }
+        }
+    }
+    ops
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -596,6 +724,114 @@ mod tests {
             s.replace_range(at..at, &te.new_text);
         }
         assert_eq!(s, "01234AB56789");
+    }
+
+    #[test]
+    fn ops_preserve_resource_op_order_relative_to_edits() {
+        // The "move item to its own file" shape: create the new file, edit it, then edit the
+        // original. Order is load-bearing — editing before creating writes into nothing.
+        let e = we(serde_json::json!({
+            "documentChanges": [
+                {"kind": "create", "uri": "file:///tmp/new.rs"},
+                {
+                    "textDocument": {"uri": "file:///tmp/new.rs", "version": null},
+                    "edits": [edit_json(0, 0, 0, "fn moved() {}")]
+                },
+                {
+                    "textDocument": {"uri": "file:///tmp/old.rs", "version": 7},
+                    "edits": [edit_json(2, 0, 40, "")]
+                }
+            ]
+        }));
+        let ops = workspace_edit_to_ops(&e);
+        assert_eq!(ops.len(), 3);
+        assert_eq!(
+            ops[0],
+            WorkspaceOp::Create {
+                path: PathBuf::from("/tmp/new.rs"),
+                overwrite: false,
+                ignore_if_exists: false,
+            }
+        );
+        match &ops[1] {
+            WorkspaceOp::Edit { path, edits } => {
+                assert_eq!(path, &PathBuf::from("/tmp/new.rs"));
+                assert_eq!(edits[0].new_text, "fn moved() {}");
+            }
+            other => panic!("expected edit to new.rs, got {other:?}"),
+        }
+        match &ops[2] {
+            WorkspaceOp::Edit { path, .. } => assert_eq!(path, &PathBuf::from("/tmp/old.rs")),
+            other => panic!("expected edit to old.rs, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ops_decode_rename_and_delete_options() {
+        let e = we(serde_json::json!({
+            "documentChanges": [
+                {
+                    "kind": "rename",
+                    "oldUri": "file:///tmp/a.rs",
+                    "newUri": "file:///tmp/b.rs",
+                    "options": {"overwrite": true}
+                },
+                {
+                    "kind": "delete",
+                    "uri": "file:///tmp/gone.rs",
+                    "options": {"recursive": true, "ignoreIfNotExists": true}
+                }
+            ]
+        }));
+        let ops = workspace_edit_to_ops(&e);
+        assert_eq!(
+            ops,
+            vec![
+                WorkspaceOp::Rename {
+                    from: PathBuf::from("/tmp/a.rs"),
+                    to: PathBuf::from("/tmp/b.rs"),
+                    overwrite: true,
+                    ignore_if_exists: false,
+                },
+                WorkspaceOp::Delete {
+                    path: PathBuf::from("/tmp/gone.rs"),
+                    recursive: true,
+                    ignore_if_not_exists: true,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn ops_sort_edits_descending_like_the_legacy_flattener() {
+        // Same back-to-front guarantee: a caller applying sequentially must not invalidate a
+        // range it has not reached yet.
+        let e = we(serde_json::json!({
+            "changes": {"file:///tmp/t.rs": [
+                edit_json(0, 1, 2, "early"),
+                edit_json(9, 1, 2, "late"),
+            ]}
+        }));
+        let ops = workspace_edit_to_ops(&e);
+        match &ops[0] {
+            WorkspaceOp::Edit { edits, .. } => {
+                let texts: Vec<&str> = edits.iter().map(|e| e.new_text.as_str()).collect();
+                assert_eq!(texts, ["late", "early"]);
+            }
+            other => panic!("expected edit, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ops_skip_non_file_uris() {
+        let e = we(serde_json::json!({
+            "documentChanges": [
+                {"kind": "create", "uri": "untitled:Untitled-1"},
+                {"kind": "rename", "oldUri": "file:///tmp/a.rs", "newUri": "untitled:x"}
+            ]
+        }));
+        assert!(workspace_edit_to_ops(&e).is_empty());
+        assert!(workspace_edit_to_ops(&lsp_types::WorkspaceEdit::default()).is_empty());
     }
 
     #[test]

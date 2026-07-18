@@ -341,21 +341,75 @@ impl LspManager {
         range: std::ops::Range<usize>,
         generation: u64,
     ) {
+        self.request_code_actions_only(path, rope, range, &[], generation);
+    }
+
+    /// As [`Self::request_code_actions`], but restricted to the given `CodeActionKind` prefixes
+    /// (LSP matches by dotted prefix, so `"refactor"` also brings in `refactor.extract` etc.).
+    /// An empty `only` asks for everything. This is what backs the Refactor This menu — without
+    /// the filter it would be swamped by quick fixes for unrelated diagnostics in range.
+    pub fn request_code_actions_only(
+        &mut self,
+        path: &Path,
+        rope: &Rope,
+        range: std::ops::Range<usize>,
+        only: &[&str],
+        generation: u64,
+    ) {
         let Some(server) = self.server_for_mut(path) else { return };
         if !matches!(server.state, ServerState::Ready | ServerState::Indexing(_)) {
             return;
         }
         let start = lsp_position(rope, range.start, server.encoding);
         let end = lsp_position(rope, range.end, server.encoding);
+        // triggerKind 1 = Invoked. `only` omitted entirely (not `[]`) means "every kind is
+        // welcome" — an empty array would instead be read as "nothing qualifies".
+        let mut context = json!({"diagnostics": [], "triggerKind": 1});
+        if !only.is_empty() {
+            context["only"] = json!(only);
+        }
         server.request(
             "textDocument/codeAction",
             json!({
                 "textDocument": {"uri": uri_of(path)},
                 "range": {"start": start, "end": end},
-                // triggerKind 1 = Invoked; `only` omitted = every kind is welcome.
-                "context": {"diagnostics": [], "triggerKind": 1},
+                "context": context,
             }),
             PendingKind::CodeAction { generation, path: path.to_path_buf() },
+        );
+    }
+
+    /// Does `path`'s server fill in code actions lazily (`codeActionProvider.resolveProvider`)?
+    /// When true, an action arriving with no `edit` is not empty — it is deferred, and must go
+    /// through [`Self::resolve_code_action`] before it can be applied.
+    pub fn code_action_resolves(&mut self, path: &Path) -> bool {
+        let Some(server) = self.server_for_mut(path) else { return false };
+        server
+            .caps
+            .get("codeActionProvider")
+            .and_then(|c| c.get("resolveProvider"))
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false)
+    }
+
+    /// `codeAction/resolve` — fetch the `edit`/`command` for an action the server deferred.
+    /// The whole action (including its opaque `data`) must be echoed back verbatim; that blob is
+    /// how the server recovers the refactor it planned. Answers as [`LspEvent::ResolvedCodeAction`].
+    pub fn resolve_code_action(
+        &mut self,
+        path: &Path,
+        action: &lsp_types::CodeAction,
+        generation: u64,
+    ) {
+        let Some(server) = self.server_for_mut(path) else { return };
+        if !matches!(server.state, ServerState::Ready | ServerState::Indexing(_)) {
+            return;
+        }
+        let Ok(params) = serde_json::to_value(action) else { return };
+        server.request(
+            "codeAction/resolve",
+            params,
+            PendingKind::ResolveCodeAction { generation, path: path.to_path_buf() },
         );
     }
 

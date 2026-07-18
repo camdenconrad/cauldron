@@ -739,6 +739,11 @@ struct App {
     /// Quick-fix state: generation we asked codeActions for + the received menu.
     fix_request_gen: Option<u64>,
     fix_menu: Option<(egui::Pos2, PathBuf, Vec<lsp_types::CodeActionOrCommand>)>,
+    /// Heading for `fix_menu` — the same popup serves Quick Fixes and Refactor This.
+    fix_menu_title: &'static str,
+    /// True while the in-flight code-action request was `only: ["refactor", …]`, so the reply
+    /// opens as Refactor This (grouped, with the built-in Rename entry) rather than Quick Fixes.
+    fix_request_refactor: bool,
     git_panel: GitPanel,
     /// Ctrl+G goto-line overlay: Some(buffer text) while open.
     goto_line: Option<String>,
@@ -760,6 +765,10 @@ struct App {
     completion_gen: Option<u64>,
     /// Waiting on completionItem/resolve for auto-import edits (path, post-accept generation).
     resolve_pending: Option<(PathBuf, u64)>,
+    /// In-flight `codeAction/resolve` for a deferred refactor: `(path, buffer generation, title)`.
+    /// The generation drops replies that land after the buffer moved on; the title is only for
+    /// the failure message, since a resolved action never reports which request it answered.
+    action_resolve_pending: Option<(PathBuf, u64, String)>,
     /// Signature help popup: (anchor pos, the server's help payload).
     sig_help: Option<(egui::Pos2, lsp_types::SignatureHelp)>,
     sig_gen: Option<u64>,
@@ -999,6 +1008,8 @@ impl App {
             last_session_save: std::time::Instant::now(),
             fix_request_gen: None,
             fix_menu: None,
+            fix_menu_title: "Quick Fixes",
+            fix_request_refactor: false,
             git_panel: GitPanel::default(),
             goto_line: None,
             rename: None,
@@ -1010,6 +1021,7 @@ impl App {
             completion: None,
             completion_gen: None,
             resolve_pending: None,
+            action_resolve_pending: None,
             sig_help: None,
             sig_gen: None,
             outline: Vec::new(),
@@ -3643,10 +3655,43 @@ impl App {
                 if self.fix_request_gen == Some(generation) {
                     self.fix_request_gen = None;
                     self.lsp_message = None;
+                    let refactor = self.fix_request_refactor;
+                    self.fix_menu_title = if refactor { "Refactor This" } else { "Quick Fixes" };
                     if actions.is_empty() {
-                        self.lsp_message = Some("no quick fixes available here".into());
+                        self.lsp_message = Some(if refactor {
+                            "no refactorings available here".into()
+                        } else {
+                            "no quick fixes available here".into()
+                        });
                     } else if let Some(pos) = ctx_pointer_pos() {
-                        self.fix_menu = Some((pos, path, actions));
+                        self.fix_menu = Some((pos, path, sort_actions_by_kind(actions)));
+                    }
+                }
+                None
+            }
+            LspEvent::ResolvedCodeAction { generation, path, action } => {
+                if self.action_resolve_pending.as_ref().is_some_and(|(p, g, _)| *p == path && *g == generation)
+                {
+                    let title = self
+                        .action_resolve_pending
+                        .take()
+                        .map_or_else(String::new, |(_, _, t)| t);
+                    self.lsp_message = None;
+                    match action {
+                        // Resolve is allowed to come back still empty (the server changed its
+                        // mind, or the range stopped qualifying) — that is a failure to report,
+                        // not a success to stay quiet about.
+                        Some(a) if a.edit.is_some() || a.command.is_some() => {
+                            // 0.0 matches the ApplyEdit arm: external edits never coalesce
+                            // into a typing group, so the timestamp is immaterial.
+                            if let Some(edit) = &a.edit {
+                                self.apply_workspace_edit(edit, 0.0);
+                            }
+                            if let Some(cmd) = &a.command {
+                                self.lsp.execute_command(&path, cmd);
+                            }
+                        }
+                        _ => self.lsp_message = Some(format!("‘{title}’ could not be applied")),
                     }
                 }
                 None
@@ -4121,6 +4166,23 @@ impl App {
                         if let Some(f) = self.groups[self.focused].active_file() {
                             let (p, r) = (f.path.clone(), f.view.selection_byte_range());
                             self.request_quick_fixes(p, r);
+                        }
+                        ui.close_menu();
+                    }
+                    if ui
+                        .button("Refactor This…    Ctrl+Alt+Shift+T")
+                        .clicked_by(egui::PointerButton::Primary)
+                    {
+                        if let Some(f) = self.groups[self.focused].active_file() {
+                            let path = f.path.clone();
+                            let range = f.view.selection_byte_range();
+                            let range = if range.is_empty() {
+                                let b = f.view.caret_byte();
+                                b..b
+                            } else {
+                                range
+                            };
+                            self.request_refactorings(path, range);
                         }
                         ui.close_menu();
                     }
@@ -5176,9 +5238,33 @@ impl App {
             let gen = f.buffer.generation;
             let rope = f.buffer.rope().clone();
             self.fix_request_gen = Some(gen);
+            self.fix_request_refactor = false;
             self.lsp.request_code_actions(&path, &rope, range, gen);
             self.lsp_message = Some("fetching quick fixes…".into());
         }
+    }
+
+    /// Ask for REFACTORINGS only (Refactor This, Ctrl+Alt+Shift+T). Filtering server-side keeps
+    /// the menu from filling with quick fixes for whatever diagnostics happen to overlap the
+    /// caret — the thing that makes an unfiltered code-action menu useless for refactoring.
+    fn request_refactorings(&mut self, path: PathBuf, range: std::ops::Range<usize>) {
+        let Some(f) =
+            self.groups.iter().flat_map(|g| g.files.iter()).find(|f| f.path == path && f.loaded)
+        else {
+            return;
+        };
+        let gen = f.buffer.generation;
+        let rope = f.buffer.rope().clone();
+        self.fix_request_gen = Some(gen);
+        self.fix_request_refactor = true;
+        self.lsp.request_code_actions_only(
+            &path,
+            &rope,
+            range,
+            &["refactor", "source"],
+            gen,
+        );
+        self.lsp_message = Some("finding refactorings…".into());
     }
 
     /// Apply one chosen code action: WorkspaceEdit through the undo-safe editor path for open
@@ -5189,6 +5275,22 @@ impl App {
                 self.lsp.execute_command(path, cmd);
             }
             lsp_types::CodeActionOrCommand::CodeAction(a) => {
+                // An action with neither edit nor command is DEFERRED, not empty: the server
+                // parked the real work behind `data` and expects a codeAction/resolve round
+                // trip. rust-analyzer ships every extract/inline refactor this way, so applying
+                // one directly used to be a silent no-op.
+                if a.edit.is_none() && a.command.is_none() && self.lsp.code_action_resolves(path) {
+                    let gen = self
+                        .groups
+                        .iter()
+                        .flat_map(|g| g.files.iter())
+                        .find(|f| f.path == path && f.loaded)
+                        .map_or(0, |f| f.buffer.generation);
+                    self.action_resolve_pending = Some((path.to_path_buf(), gen, a.title.clone()));
+                    self.lsp.resolve_code_action(path, a, gen);
+                    self.lsp_message = Some(format!("{}…", a.title));
+                    return;
+                }
                 if let Some(edit) = &a.edit {
                     self.apply_workspace_edit(edit, now);
                 }
@@ -5211,54 +5313,211 @@ impl App {
     }
 
     fn apply_workspace_edit(&mut self, edit: &lsp_types::WorkspaceEdit, now: f64) {
-        for (file, edits) in txsync::workspace_edit_to_file_edits(edit) {
-            let enc = self.lsp_encoding(&file);
-            // A lazy tab is NOT an open buffer: route its edits to the DISK branch (editing
-            // the empty stub then saving would truncate the real file).
-            let open = self
-                .groups
-                .iter_mut()
-                .flat_map(|g| g.files.iter_mut())
-                .find(|f| f.path == file && f.loaded);
-            match open {
-                Some(f) => {
-                    // Edits arrive DESCENDING by start → one back-to-front transaction. The
-                    // Transaction contract wants ASCENDING disjoint changes; reverse into order.
-                    let rope = f.buffer.rope().clone();
-                    let mut changes: Vec<cauldron_editor::buffer::Change> = edits
-                        .iter()
-                        .map(|te| {
-                            let s = pos_to_byte(&rope, &te.range.start, enc);
-                            let e = pos_to_byte(&rope, &te.range.end, enc).max(s);
-                            cauldron_editor::buffer::Change {
-                                start: s,
-                                end: e,
-                                text: te.new_text.clone(),
-                            }
-                        })
-                        .collect();
-                    changes.reverse();
-                    changes.sort_by_key(|c| c.start);
-                    let tx = cauldron_editor::Transaction { changes };
-                    f.view.apply_external(&mut f.buffer, &tx, now);
-                    f.dirty = true;
+        let ops = txsync::workspace_edit_to_ops(edit);
+        let mut failures: Vec<String> = Vec::new();
+        for op in ops {
+            let res = match op {
+                txsync::WorkspaceOp::Edit { path, edits } => self.apply_text_edits(&path, &edits, now),
+                txsync::WorkspaceOp::Create { path, overwrite, ignore_if_exists } => {
+                    self.create_file_op(&path, overwrite, ignore_if_exists)
                 }
-                None => {
-                    // Not open: rope read-modify-write, edits already back-to-front.
-                    if let Ok(text) = std::fs::read_to_string(&file) {
-                        let mut rope = Rope::from_str(&text);
-                        for te in &edits {
-                            let s = pos_to_byte(&rope, &te.range.start, enc);
-                            let e = pos_to_byte(&rope, &te.range.end, enc).max(s);
-                            let (cs, ce) = (rope.byte_to_char(s), rope.byte_to_char(e));
-                            rope.remove(cs..ce);
-                            rope.insert(cs, &te.new_text);
+                txsync::WorkspaceOp::Rename { from, to, overwrite, ignore_if_exists } => {
+                    self.rename_file_op(&from, &to, overwrite, ignore_if_exists)
+                }
+                txsync::WorkspaceOp::Delete { path, recursive, ignore_if_not_exists } => {
+                    self.delete_file_op(&path, recursive, ignore_if_not_exists)
+                }
+            };
+            if let Err(e) = res {
+                failures.push(e);
+            }
+        }
+        if !failures.is_empty() {
+            // These used to be `let _ = fs::write(…)` — a half-applied refactor that reported
+            // success. Surface it: a partially applied workspace edit is exactly when the user
+            // most needs to know to check their tree.
+            log::warn!("workspace edit had {} failure(s): {}", failures.len(), failures.join("; "));
+            self.lsp_message = Some(format!(
+                "refactor partly failed — {}",
+                failures.first().cloned().unwrap_or_default()
+            ));
+        }
+    }
+
+    /// Text edits for one file: undo-safe editor transaction when the buffer is open and loaded,
+    /// read-modify-write otherwise. `edits` must be DESCENDING by position (as
+    /// [`txsync::workspace_edit_to_ops`] returns them).
+    fn apply_text_edits(
+        &mut self,
+        file: &Path,
+        edits: &[lsp_types::TextEdit],
+        now: f64,
+    ) -> Result<(), String> {
+        let enc = self.lsp_encoding(file);
+        // A lazy tab is NOT an open buffer: route its edits to the DISK branch (editing
+        // the empty stub then saving would truncate the real file).
+        let open = self
+            .groups
+            .iter_mut()
+            .flat_map(|g| g.files.iter_mut())
+            .find(|f| f.path == file && f.loaded);
+        match open {
+            Some(f) => {
+                // Edits arrive DESCENDING by start → one back-to-front transaction. The
+                // Transaction contract wants ASCENDING disjoint changes; reverse into order.
+                let rope = f.buffer.rope().clone();
+                let mut changes: Vec<cauldron_editor::buffer::Change> = edits
+                    .iter()
+                    .map(|te| {
+                        let s = pos_to_byte(&rope, &te.range.start, enc);
+                        let e = pos_to_byte(&rope, &te.range.end, enc).max(s);
+                        cauldron_editor::buffer::Change {
+                            start: s,
+                            end: e,
+                            text: te.new_text.clone(),
                         }
-                        let _ = std::fs::write(&file, rope.to_string());
+                    })
+                    .collect();
+                changes.reverse();
+                changes.sort_by_key(|c| c.start);
+                let tx = cauldron_editor::Transaction { changes };
+                f.view.apply_external(&mut f.buffer, &tx, now);
+                f.dirty = true;
+                Ok(())
+            }
+            None => {
+                // Not open: rope read-modify-write, edits already back-to-front. A closed file
+                // has no undo stack, so snapshot into local history first — that is the only
+                // way back if the refactor is wrong.
+                let text = std::fs::read_to_string(file)
+                    .map_err(|e| format!("{}: {e}", file.display()))?;
+                localhist::record(file, &text);
+                let mut rope = Rope::from_str(&text);
+                for te in edits {
+                    let s = pos_to_byte(&rope, &te.range.start, enc);
+                    let e = pos_to_byte(&rope, &te.range.end, enc).max(s);
+                    let (cs, ce) = (rope.byte_to_char(s), rope.byte_to_char(e));
+                    rope.remove(cs..ce);
+                    rope.insert(cs, &te.new_text);
+                }
+                std::fs::write(file, rope.to_string())
+                    .map_err(|e| format!("{}: {e}", file.display()))
+            }
+        }
+    }
+
+    /// `CreateFile` resource op. Default LSP semantics: without `overwrite`, an existing file is
+    /// left ALONE (and that is only an error when `ignoreIfExists` is also unset).
+    fn create_file_op(
+        &mut self,
+        path: &Path,
+        overwrite: bool,
+        ignore_if_exists: bool,
+    ) -> Result<(), String> {
+        if path.exists() && !overwrite {
+            return if ignore_if_exists {
+                Ok(())
+            } else {
+                Err(format!("{} already exists", path.display()))
+            };
+        }
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| format!("{}: {e}", parent.display()))?;
+        }
+        std::fs::write(path, "").map_err(|e| format!("{}: {e}", path.display()))
+    }
+
+    /// `RenameFile` resource op — the file move behind Move refactorings. Open tabs follow the
+    /// file, and the language server is told the doc moved, or it keeps diagnosing a ghost.
+    fn rename_file_op(
+        &mut self,
+        from: &Path,
+        to: &Path,
+        overwrite: bool,
+        ignore_if_exists: bool,
+    ) -> Result<(), String> {
+        if to.exists() && !overwrite {
+            return if ignore_if_exists {
+                Ok(())
+            } else {
+                Err(format!("{} already exists", to.display()))
+            };
+        }
+        if let Some(parent) = to.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| format!("{}: {e}", parent.display()))?;
+        }
+        std::fs::rename(from, to).map_err(|e| format!("{} → {}: {e}", from.display(), to.display()))?;
+        self.retarget_open_tabs(from, to);
+        Ok(())
+    }
+
+    /// `DeleteFile` resource op (Safe Delete). Closes any tab on the file first — a tab pointing
+    /// at a deleted path saves it right back into existence.
+    fn delete_file_op(
+        &mut self,
+        path: &Path,
+        recursive: bool,
+        ignore_if_not_exists: bool,
+    ) -> Result<(), String> {
+        if !path.exists() {
+            return if ignore_if_not_exists {
+                Ok(())
+            } else {
+                Err(format!("{} does not exist", path.display()))
+            };
+        }
+        // Last-resort undo for a delete: stash the content in local history first.
+        if path.is_file() {
+            if let Ok(text) = std::fs::read_to_string(path) {
+                localhist::record(path, &text);
+            }
+        }
+        self.forget_open_tabs(path);
+        let res = if path.is_dir() && recursive {
+            std::fs::remove_dir_all(path)
+        } else if path.is_dir() {
+            std::fs::remove_dir(path)
+        } else {
+            std::fs::remove_file(path)
+        };
+        res.map_err(|e| format!("{}: {e}", path.display()))
+    }
+
+    /// Point every open tab on `from` at `to` after a file move, and re-key the language server's
+    /// document (close old uri, open new) so completions and diagnostics keep working.
+    fn retarget_open_tabs(&mut self, from: &Path, to: &Path) {
+        let mut moved_text: Option<String> = None;
+        for g in &mut self.groups {
+            for f in &mut g.files {
+                if f.path == from {
+                    f.path = to.to_path_buf();
+                    f.lang = Lang::from_path(&to.to_string_lossy());
+                    if f.loaded && moved_text.is_none() {
+                        moved_text = Some(f.buffer.rope().to_string());
                     }
                 }
             }
         }
+        self.lsp.close_doc(from);
+        if let Some(text) = moved_text {
+            // Re-derive the language from the NEW path: a move can change the extension, and the
+            // stale tab lang would route the doc to the wrong server.
+            if let Some(lang) = Lang::from_path(&to.to_string_lossy()) {
+                let root = self.workspace.root.clone();
+                self.lsp.open_doc(lang, &root, to, &text);
+            }
+        }
+    }
+
+    /// Drop any tab (and language-server doc) pointing at a path that is about to be deleted.
+    fn forget_open_tabs(&mut self, path: &Path) {
+        for g in &mut self.groups {
+            if let Some(i) = g.files.iter().position(|f| f.path == path) {
+                g.files.remove(i);
+                g.active = g.active.min(g.files.len().saturating_sub(1));
+            }
+        }
+        self.lsp.close_doc(path);
     }
 
     /// The inline AI-edit modal: instruction box → background request → reply replaces the
@@ -6690,6 +6949,29 @@ impl eframe::App for App {
         if !shell && ctx.input(|i| i.modifiers.alt && i.key_pressed(egui::Key::F7)) {
             self.find_usages();
         }
+        // Ctrl+Alt+Shift+T — Refactor This.
+        if !shell
+            && ctx.input(|i| {
+                i.modifiers.command
+                    && i.modifiers.alt
+                    && i.modifiers.shift
+                    && i.key_pressed(egui::Key::T)
+            })
+        {
+            if let Some(f) = self.groups[self.focused].active_file() {
+                let path = f.path.clone();
+                // Unlike a quick fix, a refactoring is usually ABOUT the selection (extract
+                // function/variable). Collapse to the caret only when nothing is selected.
+                let range = f.view.selection_byte_range();
+                let range = if range.is_empty() {
+                    let b = f.view.caret_byte();
+                    b..b
+                } else {
+                    range
+                };
+                self.request_refactorings(path, range);
+            }
+        }
         if !shell && ctx.input(|i| i.modifiers.alt && i.key_pressed(egui::Key::Enter)) {
             if let Some(f) = self.groups[self.focused].active_file() {
                 let (p, b) = (f.path.clone(), f.view.caret_byte());
@@ -7986,8 +8268,37 @@ impl eframe::App for App {
                 .show(ctx, |ui| {
                     egui::Frame::popup(ui.style()).show(ui, |ui| {
                         ui.set_min_width(260.0);
-                        style::panel_header_inline(ui, "Quick Fixes");
+                        style::panel_header_inline(ui, self.fix_menu_title);
+                        // Rename is ours, not the server's — it has a dedicated inline editor and
+                        // its own shortcut, so it never shows up among code actions. In a
+                        // Refactor This menu its absence would be conspicuous.
+                        if self.fix_menu_title == "Refactor This" {
+                            if ui
+                                .selectable_label(
+                                    false,
+                                    egui::RichText::new("Rename…                Shift+F6").size(12.5),
+                                )
+                                .clicked_by(egui::PointerButton::Primary)
+                            {
+                                self.start_rename();
+                                close_menu = true;
+                            }
+                            ui.separator();
+                        }
+                        let mut group_shown = "";
                         for (i, action) in actions.iter().enumerate() {
+                            let group = action_group(action);
+                            if group != group_shown {
+                                if !group_shown.is_empty() {
+                                    ui.add_space(2.0);
+                                }
+                                group_shown = group;
+                                ui.label(
+                                    egui::RichText::new(group)
+                                        .size(10.5)
+                                        .color(style::colors::TEXT_MUTED()),
+                                );
+                            }
                             let (title, preferred) = match action {
                                 lsp_types::CodeActionOrCommand::Command(c) => (c.title.clone(), false),
                                 lsp_types::CodeActionOrCommand::CodeAction(a) => {
@@ -8597,6 +8908,54 @@ fn split_source(msg: &str) -> (String, String) {
 /// Last known pointer position — captured via a thread-local set each frame would be overkill;
 /// egui exposes it through the context the popup is drawn with, so we stash it here instead.
 static POINTER_POS: Mutex<Option<(f32, f32)>> = Mutex::new(None);
+
+/// Which heading a code action sits under in the menu, from its `CodeActionKind`. LSP kinds are
+/// dotted and open-ended (`refactor.extract.function`), so match by prefix and let anything
+/// unrecognized fall into "Other".
+fn action_group(action: &lsp_types::CodeActionOrCommand) -> &'static str {
+    let kind = match action {
+        // A bare Command carries no kind at all — servers send these for the odd action that
+        // predates code-action literals.
+        lsp_types::CodeActionOrCommand::Command(_) => return "Other",
+        lsp_types::CodeActionOrCommand::CodeAction(a) => {
+            a.kind.as_ref().map(|k| k.as_str().to_string()).unwrap_or_default()
+        }
+    };
+    match () {
+        _ if kind.starts_with("refactor.extract") => "Extract",
+        _ if kind.starts_with("refactor.inline") => "Inline",
+        _ if kind.starts_with("refactor.move") => "Move",
+        _ if kind.starts_with("refactor.rewrite") => "Rewrite",
+        _ if kind.starts_with("refactor") => "Refactor",
+        _ if kind.starts_with("source") => "Source",
+        _ if kind.starts_with("quickfix") => "Quick Fix",
+        _ => "Other",
+    }
+}
+
+/// Rank for [`action_group`] headings, so groups appear in a stable, useful order rather than
+/// whatever sequence the server emitted.
+fn action_group_rank(group: &str) -> u8 {
+    match group {
+        "Extract" => 0,
+        "Inline" => 1,
+        "Move" => 2,
+        "Rewrite" => 3,
+        "Refactor" => 4,
+        "Quick Fix" => 5,
+        "Source" => 6,
+        _ => 7,
+    }
+}
+
+/// Group actions by kind for display. Sort is STABLE, so within a group the server's own
+/// ordering (which encodes its relevance ranking) is preserved.
+fn sort_actions_by_kind(
+    mut actions: Vec<lsp_types::CodeActionOrCommand>,
+) -> Vec<lsp_types::CodeActionOrCommand> {
+    actions.sort_by_key(|a| action_group_rank(action_group(a)));
+    actions
+}
 
 fn ctx_pointer_pos() -> Option<egui::Pos2> {
     POINTER_POS.lock().unwrap().map(|(x, y)| egui::Pos2::new(x, y))
