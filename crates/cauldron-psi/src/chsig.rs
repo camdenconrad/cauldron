@@ -550,6 +550,41 @@ void use(void) { add(1, \"x\"); add(2, \"y\"); }
     }
 
     #[test]
+    fn cross_file_extern_function_updates_header_definition_and_all_callers() {
+        // The shape that actually matters in cFS: prototype in a header, definition in one .c,
+        // callers spread across others. A non-static function has external linkage, so every
+        // file participates.
+        let hdr = "int CFE_Send(int msg, int len);\n";
+        let def = "#include \"api.h\"\nint CFE_Send(int msg, int len) { return msg + len; }\n";
+        let c1 = "#include \"api.h\"\nvoid a(void) { CFE_Send(1, 2); }\n";
+        let c2 = "#include \"api.h\"\nvoid b(void) { CFE_Send(3, 4); CFE_Send(5, 6); }\n";
+        let (index, texts) =
+            index_of(&[("/p/api.h", hdr), ("/p/api.c", def), ("/p/a.c", c1), ("/p/b.c", c2)]);
+
+        // Swap the parameters and add a third with a default at every existing call.
+        let change = SignatureChange {
+            function: "CFE_Send".into(),
+            params: vec![
+                keep(1),
+                keep(0),
+                ParamOp::New { text: "int flags".into(), default_arg: "0".into() },
+            ],
+        };
+        let plan = plan(&index, &change, |p| texts.get(p).cloned()).unwrap();
+        assert_eq!(plan.declarations_rewritten, 2, "header prototype + definition");
+        assert_eq!(plan.call_sites_rewritten, 3);
+        assert_eq!(plan.files_touched(), 4);
+        assert!(plan.warnings.is_empty(), "unexpected warnings: {:?}", plan.warnings);
+
+        let out = apply(&plan, &texts);
+        assert_eq!(out[&PathBuf::from("/p/api.h")], "int CFE_Send(int len, int msg, int flags);\n");
+        assert!(out[&PathBuf::from("/p/api.c")].contains("int CFE_Send(int len, int msg, int flags)"));
+        assert!(out[&PathBuf::from("/p/a.c")].contains("CFE_Send(2, 1, 0)"));
+        assert!(out[&PathBuf::from("/p/b.c")].contains("CFE_Send(4, 3, 0)"));
+        assert!(out[&PathBuf::from("/p/b.c")].contains("CFE_Send(6, 5, 0)"));
+    }
+
+    #[test]
     fn added_parameter_uses_default_argument_at_existing_calls() {
         let src = "\
 int f(int a) { return a; }
