@@ -143,20 +143,38 @@ fn signature_of(node: Node, src: &str) -> Option<RustSignature> {
     })
 }
 
-/// The signature of the function whose NAME token contains `offset`.
-///
-/// This is the definition-side test for a reference: rust-analyzer reports a declaration by the
-/// position of its name, and both `fn` items and trait method signatures answer here — which is
-/// what makes a trait method and all of its impls rewrite together.
-pub fn signature_at_name(src: &str, offset: usize) -> Option<RustSignature> {
-    let mut p = parser()?;
-    let tree = p.parse(src, None)?;
+/// One parsed file, so a plan over N references in the same file parses it ONCE rather than N
+/// times. Re-parsing per reference turned a large refactor into minutes of CPU.
+pub struct ParsedFile {
+    tree: tree_sitter::Tree,
+}
+
+impl ParsedFile {
+    pub fn new(src: &str) -> Option<Self> {
+        let mut p = parser()?;
+        Some(Self { tree: p.parse(src, None)? })
+    }
+
+    /// See [`signature_at_name`].
+    pub fn signature_at_name(&self, src: &str, offset: usize) -> Option<RustSignature> {
+        signature_at_name_in(self.tree.root_node(), src, offset)
+    }
+
+    /// See [`call_at_name`].
+    pub fn call_at_name(&self, offset: usize) -> Option<RustCall> {
+        call_at_name_in(self.tree.root_node(), offset)
+    }
+
+    /// See [`all_calls_named`].
+    pub fn calls_named(&self, src: &str, name: &str) -> Vec<RustCall> {
+        calls_named_in(self.tree.root_node(), src, name)
+    }
+}
+
+fn signature_at_name_in(root: Node, src: &str, offset: usize) -> Option<RustSignature> {
     let mut found = None;
-    walk(tree.root_node(), |n| {
-        if found.is_some() {
-            return false;
-        }
-        if !n.byte_range().contains(&offset) {
+    walk(root, |n| {
+        if found.is_some() || !n.byte_range().contains(&offset) {
             return false;
         }
         if n.kind() == "function_item" || n.kind() == "function_signature_item" {
@@ -170,6 +188,67 @@ pub fn signature_at_name(src: &str, offset: usize) -> Option<RustSignature> {
         true
     });
     found
+}
+
+fn call_at_name_in(root: Node, offset: usize) -> Option<RustCall> {
+    let mut found = None;
+    walk(root, |n| {
+        if found.is_some() || !n.byte_range().contains(&offset) {
+            return false;
+        }
+        if n.kind() == "call_expression" {
+            if let (Some(func), Some(args)) =
+                (n.child_by_field_name("function"), n.child_by_field_name("arguments"))
+            {
+                if let Some((form, name_range)) = call_form(func) {
+                    if name_range.contains(&offset) {
+                        found = Some(RustCall {
+                            form,
+                            args_range: args.byte_range(),
+                            arg_ranges: arg_spans(args),
+                        });
+                        return false;
+                    }
+                }
+            }
+        }
+        true
+    });
+    found
+}
+
+fn calls_named_in(root: Node, src: &str, name: &str) -> Vec<RustCall> {
+    let mut out = Vec::new();
+    walk(root, |n| {
+        if n.kind() == "call_expression" {
+            if let (Some(func), Some(args)) =
+                (n.child_by_field_name("function"), n.child_by_field_name("arguments"))
+            {
+                if let Some((form, name_range)) = call_form(func) {
+                    if src.get(name_range).is_some_and(|t| t == name) {
+                        out.push(RustCall {
+                            form,
+                            args_range: args.byte_range(),
+                            arg_ranges: arg_spans(args),
+                        });
+                    }
+                }
+            }
+        }
+        true
+    });
+    out
+}
+
+/// The signature of the function whose NAME token contains `offset`.
+///
+/// This is the definition-side test for a reference: rust-analyzer reports a declaration by the
+/// position of its name, and both `fn` items and trait method signatures answer here — which is
+/// what makes a trait method and all of its impls rewrite together.
+pub fn signature_at_name(src: &str, offset: usize) -> Option<RustSignature> {
+    let mut p = parser()?;
+    let tree = p.parse(src, None)?;
+    signature_at_name_in(tree.root_node(), src, offset)
 }
 
 /// The signature of the innermost function ENCLOSING `offset` — used to seed the dialog from a
@@ -230,30 +309,7 @@ fn call_form(func: Node) -> Option<(CallForm, Range<usize>)> {
 pub fn call_at_name(src: &str, offset: usize) -> Option<RustCall> {
     let mut p = parser()?;
     let tree = p.parse(src, None)?;
-    let mut found = None;
-    walk(tree.root_node(), |n| {
-        if found.is_some() || !n.byte_range().contains(&offset) {
-            return false;
-        }
-        if n.kind() == "call_expression" {
-            if let (Some(func), Some(args)) =
-                (n.child_by_field_name("function"), n.child_by_field_name("arguments"))
-            {
-                if let Some((form, name_range)) = call_form(func) {
-                    if name_range.contains(&offset) {
-                        found = Some(RustCall {
-                            form,
-                            args_range: args.byte_range(),
-                            arg_ranges: arg_spans(args),
-                        });
-                        return false;
-                    }
-                }
-            }
-        }
-        true
-    });
-    found
+    call_at_name_in(tree.root_node(), offset)
 }
 
 fn arg_spans(args: Node) -> Vec<Range<usize>> {
@@ -267,28 +323,8 @@ fn arg_spans(args: Node) -> Vec<Range<usize>> {
 /// Every call of the same callee name nested anywhere inside `src`, used to detect the
 /// containing/contained overlap that nested calls produce.
 fn all_calls_named(src: &str, name: &str) -> Vec<RustCall> {
-    let Some(mut p) = parser() else { return Vec::new() };
-    let Some(tree) = p.parse(src, None) else { return Vec::new() };
-    let mut out = Vec::new();
-    walk(tree.root_node(), |n| {
-        if n.kind() == "call_expression" {
-            if let (Some(func), Some(args)) =
-                (n.child_by_field_name("function"), n.child_by_field_name("arguments"))
-            {
-                if let Some((form, name_range)) = call_form(func) {
-                    if src.get(name_range).is_some_and(|t| t == name) {
-                        out.push(RustCall {
-                            form,
-                            args_range: args.byte_range(),
-                            arg_ranges: arg_spans(args),
-                        });
-                    }
-                }
-            }
-        }
-        true
-    });
-    out
+    let Some(p) = ParsedFile::new(src) else { return Vec::new() };
+    p.calls_named(src, name)
 }
 
 /// Render a Rust parameter list body (no parens), preserving `self` at the front.
@@ -350,8 +386,9 @@ pub fn plan(
     let mut signature: Option<RustSignature> = None;
     for (path, offsets) in &by_file {
         let Some(text) = read(&mut texts, path, &mut text_of) else { continue };
+        let Some(parsed) = ParsedFile::new(&text) else { continue };
         for &off in offsets {
-            if let Some(sig) = signature_at_name(&text, off) {
+            if let Some(sig) = parsed.signature_at_name(&text, off) {
                 if sig.name == name {
                     signature = Some(sig);
                     break;
@@ -380,13 +417,19 @@ pub fn plan(
             plan.warnings.push(Warning::UnreadableFile { path: path.clone() });
             continue;
         };
+        // Parse ONCE per file: a hot function can have hundreds of references in one file, and
+        // re-parsing per reference is quadratic in file size.
+        let Some(parsed) = ParsedFile::new(&text) else {
+            plan.warnings.push(Warning::UnreadableFile { path: path.clone() });
+            continue;
+        };
         // Every call of this name in this file — needed to spot nesting, which produces
         // containing/contained edits that cannot both be applied.
-        let calls_here = all_calls_named(&text, name);
+        let calls_here = parsed.calls_named(&text, name);
 
         for &off in offsets {
             // Definition side: a declaration, an inherent impl, or a trait method + its impls.
-            if let Some(sig) = signature_at_name(&text, off) {
+            if let Some(sig) = parsed.signature_at_name(&text, off) {
                 if sig.name != name {
                     continue;
                 }
@@ -411,7 +454,7 @@ pub fn plan(
             }
 
             // Call side.
-            let Some(call) = call_at_name(&text, off) else {
+            let Some(call) = parsed.call_at_name(off) else {
                 // A reference that is neither: `use` item, a re-export, or the function passed
                 // by value. Distinguish the value case, which is a real hazard.
                 let kind = if is_value_reference(&text, off, name) {
