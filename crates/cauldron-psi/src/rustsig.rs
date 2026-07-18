@@ -80,6 +80,8 @@ impl RustSignature {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RustCall {
     pub form: CallForm,
+    /// The callee's final path segment — `m` in both `x.m(..)` and `T::m(..)`.
+    pub callee: String,
     /// The `arguments` node INCLUDING its parentheses.
     pub args_range: Range<usize>,
     pub arg_ranges: Vec<Range<usize>>,
@@ -161,8 +163,8 @@ impl ParsedFile {
     }
 
     /// See [`call_at_name`].
-    pub fn call_at_name(&self, offset: usize) -> Option<RustCall> {
-        call_at_name_in(self.tree.root_node(), offset)
+    pub fn call_at_name(&self, src: &str, offset: usize) -> Option<RustCall> {
+        call_at_name_in(self.tree.root_node(), src, offset)
     }
 
     /// See [`all_calls_named`].
@@ -190,7 +192,7 @@ fn signature_at_name_in(root: Node, src: &str, offset: usize) -> Option<RustSign
     found
 }
 
-fn call_at_name_in(root: Node, offset: usize) -> Option<RustCall> {
+fn call_at_name_in(root: Node, src: &str, offset: usize) -> Option<RustCall> {
     let mut found = None;
     walk(root, |n| {
         if found.is_some() || !n.byte_range().contains(&offset) {
@@ -204,6 +206,7 @@ fn call_at_name_in(root: Node, offset: usize) -> Option<RustCall> {
                     if name_range.contains(&offset) {
                         found = Some(RustCall {
                             form,
+                            callee: src.get(name_range).unwrap_or_default().to_string(),
                             args_range: args.byte_range(),
                             arg_ranges: arg_spans(args),
                         });
@@ -228,6 +231,7 @@ fn calls_named_in(root: Node, src: &str, name: &str) -> Vec<RustCall> {
                     if src.get(name_range).is_some_and(|t| t == name) {
                         out.push(RustCall {
                             form,
+                            callee: name.to_string(),
                             args_range: args.byte_range(),
                             arg_ranges: arg_spans(args),
                         });
@@ -309,7 +313,7 @@ fn call_form(func: Node) -> Option<(CallForm, Range<usize>)> {
 pub fn call_at_name(src: &str, offset: usize) -> Option<RustCall> {
     let mut p = parser()?;
     let tree = p.parse(src, None)?;
-    call_at_name_in(tree.root_node(), offset)
+    call_at_name_in(tree.root_node(), src, offset)
 }
 
 fn arg_spans(args: Node) -> Vec<Range<usize>> {
@@ -318,13 +322,6 @@ fn arg_spans(args: Node) -> Vec<Range<usize>> {
         .filter(|c| !matches!(c.kind(), "line_comment" | "block_comment"))
         .map(|c| c.byte_range())
         .collect()
-}
-
-/// Every call of the same callee name nested anywhere inside `src`, used to detect the
-/// containing/contained overlap that nested calls produce.
-fn all_calls_named(src: &str, name: &str) -> Vec<RustCall> {
-    let Some(p) = ParsedFile::new(src) else { return Vec::new() };
-    p.calls_named(src, name)
 }
 
 /// Render a Rust parameter list body (no parens), preserving `self` at the front.
@@ -454,7 +451,7 @@ pub fn plan(
             }
 
             // Call side.
-            let Some(call) = parsed.call_at_name(off) else {
+            let Some(call) = parsed.call_at_name(&text, off) else {
                 // A reference that is neither: `use` item, a re-export, or the function passed
                 // by value. Distinguish the value case, which is a real hazard.
                 let kind = if is_value_reference(&text, off, name) {
@@ -616,6 +613,50 @@ fn read(
     let t = text_of(path)?;
     cache.insert(path.to_path_buf(), t.clone());
     Some(t)
+}
+
+/// Which function the caret at `offset` MEANS.
+///
+/// A caret on `t.m(1, 2)` means `m`, not the enclosing `go` — resolving to the enclosing
+/// function there silently offers to refactor the wrong thing. Order matters: a call site wins
+/// over the function that contains it, and only a caret on neither falls back to the enclosing
+/// definition.
+///
+/// Note this returns a NAME, not a signature: the callee's declaration usually lives in another
+/// file, so the parameter list has to come from rust-analyzer's reference set, not from here.
+pub fn target_name_at(src: &str, offset: usize) -> Option<String> {
+    let parsed = ParsedFile::new(src)?;
+    if let Some(sig) = parsed.signature_at_name(src, offset) {
+        return Some(sig.name);
+    }
+    if let Some(call) = parsed.call_at_name(src, offset) {
+        return Some(call.callee);
+    }
+    enclosing_signature(src, offset).map(|s| s.name)
+}
+
+/// The parameter list of the declaration of `name` among a set of parsed references, for seeding
+/// the dialog once rust-analyzer answers. Returns `(has_self, params)`.
+pub fn params_from_references(
+    references: &[Reference],
+    name: &str,
+    mut text_of: impl FnMut(&Path) -> Option<String>,
+) -> Option<Vec<String>> {
+    for r in references {
+        let Some(text) = text_of(&r.path) else { continue };
+        let Some(parsed) = ParsedFile::new(&text) else { continue };
+        let Some(sig) = parsed.signature_at_name(&text, r.offset) else { continue };
+        if sig.name != name {
+            continue;
+        }
+        return Some(
+            sig.param_ranges
+                .iter()
+                .map(|x| text.get(x.clone()).unwrap_or("").trim().to_string())
+                .collect(),
+        );
+    }
+    None
 }
 
 /// The current parameter list of the function whose name token is at `offset`, for seeding the
@@ -906,6 +947,48 @@ fn go(v: &[u8]) { f(v, 3); }
             out[&PathBuf::from("/s/a.rs")]
         );
         assert!(out[&PathBuf::from("/s/a.rs")].contains("f(3, v)"));
+    }
+
+    #[test]
+    fn caret_on_a_call_targets_the_callee_not_the_enclosing_function() {
+        // THE regression: invoking on `t.m(1, 2)` inside `fn go` must mean `m`. Falling back to
+        // the enclosing function silently offers to refactor `go` instead.
+        let src = "\
+struct T;
+impl T {
+    fn m(&self, a: i32) {}
+}
+fn go(t: T) { t.m(1); free(2); }
+fn free(x: i32) {}
+";
+        assert_eq!(target_name_at(src, nth(src, "t.m(", 0) + 2).as_deref(), Some("m"));
+        assert_eq!(target_name_at(src, nth(src, "free(2)", 0) + 1).as_deref(), Some("free"));
+        // On the definition's own name.
+        assert_eq!(target_name_at(src, nth(src, "fn m", 0) + 3).as_deref(), Some("m"));
+        // Inside a body but on no call at all → the enclosing function.
+        assert_eq!(target_name_at(src, nth(src, "fn go", 0) + 3).as_deref(), Some("go"));
+    }
+
+    #[test]
+    fn ufcs_caret_targets_the_method_not_the_type() {
+        let src = "struct T;\nfn go(t: T) { T::m(&t, 1); }\n";
+        // The caret on `m` in `T::m` means the method, not `T`.
+        assert_eq!(target_name_at(src, nth(src, "T::m", 0) + 3).as_deref(), Some("m"));
+    }
+
+    #[test]
+    fn params_come_from_the_declaration_among_the_references() {
+        // The declaration usually lives in a DIFFERENT file from the call the user invoked on,
+        // so the dialog cannot seed its rows locally — they come from the reference set.
+        let decl = "pub fn send(msg: i32, len: usize) {}\n";
+        let call = "fn go() { send(1, 2); }\n";
+        let t = texts(&[("/s/a.rs", decl), ("/s/b.rs", call)]);
+        let rs = refs(&[
+            ("/s/b.rs", nth(call, "send(1", 0)),
+            ("/s/a.rs", nth(decl, "send", 0)),
+        ]);
+        let params = params_from_references(&rs, "send", |p| t.get(p).cloned()).unwrap();
+        assert_eq!(params, ["msg: i32", "len: usize"]);
     }
 
     #[test]

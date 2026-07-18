@@ -60,15 +60,20 @@ pub struct ChangeSigUi {
     error: Option<String>,
     /// Set when `rows` changed and the preview is stale.
     dirty: bool,
+    /// True while the parameter rows have not been established yet (Rust, waiting on
+    /// rust-analyzer). An empty row list otherwise reads as "remove every parameter", so
+    /// applying while unseeded would silently delete the whole signature.
+    awaiting_seed: bool,
 }
 
 impl ChangeSigUi {
     pub fn new(engine: Engine, function: String, path: PathBuf, params: Vec<String>) -> Self {
-        let rows = params
+        let rows: Vec<Row> = params
             .iter()
             .enumerate()
             .map(|(i, p)| Row { from: Some(i), text: p.clone(), default_arg: String::new() })
             .collect();
+        let awaiting_seed = rows.is_empty() && matches!(engine, Engine::Rust(_));
         Self {
             engine,
             function,
@@ -78,6 +83,7 @@ impl ChangeSigUi {
             plan: None,
             error: None,
             dirty: true,
+            awaiting_seed,
         }
     }
 
@@ -110,6 +116,31 @@ impl ChangeSigUi {
 
     /// Force the next frame to recompute the preview — used when the reference set arrives.
     pub fn mark_dirty(&mut self) {
+        self.dirty = true;
+    }
+
+    /// Fill in the parameter rows once the declaration is known.
+    ///
+    /// The Rust path cannot seed locally: the caret is often on a CALL whose declaration lives in
+    /// another file, so the rows arrive with rust-analyzer's reference set. A no-op if the user
+    /// already edited rows, so a late reply cannot discard their work.
+    pub fn seed_params(&mut self, params: Vec<String>) {
+        if !self.rows.is_empty() {
+            self.awaiting_seed = false;
+            return;
+        }
+        // A genuinely zero-parameter function seeds as "seeded, no rows" — that is a valid
+        // starting point, and distinct from "we never found the declaration".
+        self.awaiting_seed = false;
+        if params.is_empty() {
+            return;
+        }
+        self.rows = params
+            .iter()
+            .enumerate()
+            .map(|(i, p)| Row { from: Some(i), text: p.clone(), default_arg: String::new() })
+            .collect();
+        self.original = params;
         self.dirty = true;
     }
 
@@ -286,6 +317,18 @@ impl ChangeSigUi {
                                 });
                         }
                     }
+                    (None, _) if self.awaiting_seed && matches!(self.engine, Engine::Rust(Some(_))) => {
+                        // References came back but none of them was the declaration, so the
+                        // original parameter list is unknown and nothing can be applied safely.
+                        ui.label(
+                            egui::RichText::new(
+                                "could not locate the declaration of this function — \
+                                 is rust-analyzer finished indexing?",
+                            )
+                            .color(style::colors::WARN())
+                            .size(12.0),
+                        );
+                    }
                     (None, None) if matches!(self.engine, Engine::Rust(None)) => {
                         ui.label(
                             egui::RichText::new("finding references (rust-analyzer)…")
@@ -304,10 +347,8 @@ impl ChangeSigUi {
 
                 ui.add_space(6.0);
                 ui.horizontal(|ui| {
-                    let can_apply = self
-                        .plan
-                        .as_ref()
-                        .is_some_and(|p| !p.is_empty())
+                    let can_apply = !self.awaiting_seed
+                        && self.plan.as_ref().is_some_and(|p| !p.is_empty())
                         && self.error.is_none()
                         // An empty declaration would produce `f(, int b)`.
                         && self.rows.iter().all(|r| !r.text.trim().is_empty());

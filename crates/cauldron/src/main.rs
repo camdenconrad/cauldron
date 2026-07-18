@@ -14,6 +14,11 @@ mod boot_trace;
 mod conflicts;
 mod checklist;
 mod chsig_ui;
+
+/// Generation namespace for the Change Signature dialog's `textDocument/references` requests.
+/// Buffer generations count up from 0, so this range is unreachable by them — which is what
+/// keeps a dialog reply from being mistaken for a Find Usages reply and vice versa.
+const CHSIG_GEN_BASE: u64 = 1 << 60;
 mod coverage;
 mod deps;
 mod blame;
@@ -747,6 +752,9 @@ struct App {
     /// Generation of the in-flight rust-analyzer references request backing the dialog. Kept
     /// separate from `usages_gen` so the reply fills the dialog instead of the Usages panel.
     chsig_refs_gen: Option<u64>,
+    /// Counter behind [`CHSIG_GEN_BASE`], keeping dialog reference requests in their own
+    /// generation namespace so they cannot collide with Find Usages.
+    chsig_req_seq: u64,
     /// True while the in-flight code-action request was `only: ["refactor", …]`, so the reply
     /// opens as Refactor This (grouped, with the built-in Rename entry) rather than Quick Fixes.
     fix_request_refactor: bool,
@@ -1017,6 +1025,7 @@ impl App {
             fix_menu_title: "Quick Fixes",
             chsig: None,
             chsig_refs_gen: None,
+            chsig_req_seq: 0,
             fix_request_refactor: false,
             git_panel: GitPanel::default(),
             goto_line: None,
@@ -5320,8 +5329,11 @@ impl App {
     /// reference. The dialog opens immediately in a "finding references" state so the user is
     /// not left staring at nothing while r-a answers.
     fn start_change_signature_rust(&mut self, path: PathBuf, byte: usize, text: String) {
-        let Some((name, params)) = cauldron_psi::rustsig::current_params(&text, byte) else {
-            self.lsp_message = Some("put the caret on a function, method, or one of its calls".into());
+        // Resolve what the caret MEANS, not what encloses it: on `t.m(1)` the target is `m`, and
+        // falling back to the enclosing function would silently refactor the wrong thing.
+        let Some(name) = cauldron_psi::rustsig::target_name_at(&text, byte) else {
+            self.lsp_message =
+                Some("put the caret on a function, method, or one of its calls".into());
             return;
         };
         let Some(f) =
@@ -5329,7 +5341,14 @@ impl App {
         else {
             return;
         };
-        let (gen, rope) = (f.buffer.generation, f.buffer.rope().clone());
+        let rope = f.buffer.rope().clone();
+        // The declaration is usually in ANOTHER file, so the parameter rows cannot be seeded
+        // here — they arrive with the reference set (see `chsig_take_references`). Seed locally
+        // only when the caret is genuinely on the declaration itself.
+        let params = cauldron_psi::rustsig::current_params(&text, byte)
+            .filter(|(n, _)| *n == name)
+            .map(|(_, p)| p)
+            .unwrap_or_default();
         self.close_overlays();
         self.chsig = Some(chsig_ui::ChangeSigUi::new(
             chsig_ui::Engine::Rust(None),
@@ -5337,8 +5356,12 @@ impl App {
             path.clone(),
             params,
         ));
-        // Reuse the references request; the dedicated generation keeps the reply from also
-        // populating the Usages panel.
+        // A DISTINCT generation namespace: `usages_gen` and this both key References replies off
+        // a bare u64, and both would otherwise be the same buffer generation — so Find Usages
+        // while the dialog is open cross-wired the two. Buffer generations count up from 0 and
+        // never reach this range.
+        self.chsig_req_seq = self.chsig_req_seq.wrapping_add(1);
+        let gen = CHSIG_GEN_BASE + self.chsig_req_seq;
         self.chsig_refs_gen = Some(gen);
         self.lsp.request_references(&path, &rope, byte, gen);
     }
@@ -5364,7 +5387,15 @@ impl App {
             let offset = pos_to_byte(&rope, &loc.range.start, enc);
             refs.push(cauldron_psi::rustsig::Reference { path, offset });
         }
+        // The declaration among the references is what supplies the parameter rows.
+        let name = self.chsig.as_ref().map(|d| d.function.clone()).unwrap_or_default();
+        let params = cauldron_psi::rustsig::params_from_references(&refs, &name, |p| {
+            self.text_for_refactor(p)
+        });
         if let Some(d) = &mut self.chsig {
+            if let Some(params) = params {
+                d.seed_params(params);
+            }
             d.engine = chsig_ui::Engine::Rust(Some(refs));
             d.mark_dirty();
         }

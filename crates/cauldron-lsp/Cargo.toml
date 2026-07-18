@@ -22,3 +22,6 @@ name = "fake-lsp"
 path = "src/bin/fake_lsp.rs"
 
 [dev-dependencies]
+# Live Change Signature smoke: the reference set comes from a REAL rust-analyzer, the spans
+# from cauldron-psi. Dev-only — the LSP crate has no runtime dependency on the index.
+cauldron-psi = { path = "../cauldron-psi" }

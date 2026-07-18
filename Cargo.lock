@@ -471,6 +471,7 @@ name = "cauldron-lsp"
 version = "0.1.0"
 dependencies = [
  "cauldron-editor",
+ "cauldron-psi",
  "log",
  "lsp-types",
  "ropey",
