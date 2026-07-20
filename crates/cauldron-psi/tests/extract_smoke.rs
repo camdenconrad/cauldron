@@ -84,7 +84,10 @@ fn accepted_extractions_are_well_formed() {
                 | Err(ExtractError::EscapingControlFlow(_))
                 | Err(ExtractError::MultipleOutputs(_))
                 | Err(ExtractError::UnknownType(_))
-                | Err(ExtractError::Unparseable) => refused += 1,
+                | Err(ExtractError::Unparseable)
+                | Err(ExtractError::Shadowed(_))
+                | Err(ExtractError::AddressTaken(_))
+                | Err(ExtractError::ComplexDeclarator(_)) => refused += 1,
             }
         }
         let _ = tried;

@@ -38,11 +38,6 @@ pub fn plan(src: &str, offset: usize, known: &dyn Fn(&str) -> bool) -> Option<St
     parser.set_language(&tree_sitter_c::language()).ok()?;
     let tree = parser.parse(src, None)?;
     let root = tree.root_node();
-    if root.has_error() {
-        // Same reasoning as extract: a recovery parse makes every inference below fiction.
-        return None;
-    }
-
     let call = enclosing_call(root, offset)?;
     let callee = call.child_by_field_name("function")?;
     if callee.kind() != "identifier" {
@@ -55,6 +50,12 @@ pub fn plan(src: &str, offset: usize, known: &dyn Fn(&str) -> bool) -> Option<St
 
     // The enclosing function, so the stub can be placed above it (declared before use).
     let host = enclosing(root, offset, "function_definition")?;
+    // Scoped to the HOST, not the whole file: a syntax error in an unrelated function elsewhere
+    // (or C++ in the same header) must not disable the action for code that parses fine. Every
+    // inference below reads types off this function's tree, so only this function must be clean.
+    if host.has_error() {
+        return None;
+    }
     let insert_at = line_start(src, host.start_byte());
 
     let args = call.child_by_field_name("arguments")?;
@@ -63,6 +64,7 @@ pub fn plan(src: &str, offset: usize, known: &dyn Fn(&str) -> bool) -> Option<St
 
     let mut guessed = false;
     let mut params: Vec<String> = Vec::new();
+    let mut used_names: Vec<String> = Vec::new();
     for (i, a) in arg_nodes.iter().enumerate() {
         let (ty, sure) = argument_type(*a, src, host);
         if !sure {
@@ -71,7 +73,13 @@ pub fn plan(src: &str, offset: usize, known: &dyn Fn(&str) -> bool) -> Option<St
         // `char *p`, not `char * p` — the star binds to the declarator in C, and every C
         // codebase writes it that way.
         let sep = if ty.ends_with('*') { "" } else { " " };
-        params.push(format!("{ty}{sep}{}", param_name(*a, src, i)));
+        // `f(n, n)` would otherwise emit two parameters called `n`, which does not compile.
+        let mut nm = param_name(*a, src, i);
+        while used_names.contains(&nm) {
+            nm = format!("{nm}_{}", i + 1);
+        }
+        used_names.push(nm.clone());
+        params.push(format!("{ty}{sep}{nm}"));
     }
     let sig_params = match params.is_empty() {
         true => "void".to_string(),
@@ -125,7 +133,10 @@ fn argument_type(a: Node, src: &str, host: Node) -> (String, bool) {
     match a.kind() {
         "number_literal" => {
             let t = &src[a.byte_range()];
-            let float = t.contains('.') || t.ends_with('f') || t.ends_with('F');
+            let hex = t.starts_with("0x") || t.starts_with("0X");
+            // `0x1f` is an INT. Only a non-hex literal's trailing f/F means float, and a hex
+            // float still needs the `p` exponent to be one.
+            let float = !hex && (t.contains('.') || t.ends_with('f') || t.ends_with('F'));
             (if float { "double" } else { "int" }.to_string(), true)
         }
         "string_literal" => ("const char *".to_string(), true),
@@ -134,19 +145,24 @@ fn argument_type(a: Node, src: &str, host: Node) -> (String, bool) {
         "identifier" => {
             let name = &src[a.byte_range()];
             match declared_type_in(host, src, name) {
-                Some(ty) => (ty, true),
+                Some(DeclLookup::Unique(ty)) => (ty, true),
+                // Declared more than once in this function (shadowing): which one the call sees
+                // depends on block scope, which is not modelled. Guess and mark it.
+                Some(DeclLookup::Ambiguous(ty)) => (ty, false),
                 None => ("int".to_string(), false),
             }
         }
         "pointer_expression" => {
-            // `&x` — a pointer to whatever x is.
-            let inner = a.named_child(0);
-            match inner.map(|i| argument_type(i, src, host)) {
-                Some((ty, sure)) if src[a.byte_range()].starts_with('&') => {
-                    (format!("{ty} *"), sure)
-                }
-                Some((ty, sure)) => (ty, sure),
-                None => ("int".to_string(), false),
+            let addr_of = src[a.byte_range()].starts_with('&');
+            let inner = a.named_child(0).map(|i| argument_type(i, src, host));
+            match (addr_of, inner) {
+                // `&x` — a pointer to whatever x is.
+                (true, Some((ty, sure))) => (format!("{ty} *"), sure),
+                // `*p` — the POINTEE type, which we would have to strip a star off `p`'s
+                // declared type to know. Answering with the pointer's own type was wrong AND
+                // marked certain; guess and say so instead.
+                (false, Some((ty, _))) => (ty.trim_end_matches([' ', '*']).to_string(), false),
+                (_, None) => ("int".to_string(), false),
             }
         }
         "cast_expression" => match a.child_by_field_name("type") {
@@ -157,10 +173,19 @@ fn argument_type(a: Node, src: &str, host: Node) -> (String, bool) {
     }
 }
 
+/// Result of resolving a name to a declaration in the host function.
+enum DeclLookup {
+    /// Exactly one declaration of this name — the type is trustworthy.
+    Unique(String),
+    /// Several declarations (shadowing). The first is returned, but the caller must treat it as
+    /// a guess: which one the call actually sees depends on block scope, which is not modelled.
+    Ambiguous(String),
+}
+
 /// The declared type of local `name` inside `host`, if a declaration or parameter gives one.
-fn declared_type_in(host: Node, src: &str, name: &str) -> Option<String> {
-    fn search(n: Node, src: &str, name: &str, out: &mut Option<String>) {
-        if out.is_some() {
+fn declared_type_in(host: Node, src: &str, name: &str) -> Option<DeclLookup> {
+    fn search(n: Node, src: &str, name: &str, found: &mut Vec<String>, depth: usize) {
+        if depth > 400 {
             return;
         }
         if n.kind() == "declaration" || n.kind() == "parameter_declaration" {
@@ -169,20 +194,23 @@ fn declared_type_in(host: Node, src: &str, name: &str) -> Option<String> {
             for d in n.children_by_field_name("declarator", &mut cur) {
                 if declarator_name(d, src).as_deref() == Some(name) {
                     if let Some(ty) = &ty {
-                        *out = Some(format!("{ty}{}", pointer_suffix(d)));
-                        return;
+                        found.push(format!("{ty}{}", pointer_suffix(d)));
                     }
                 }
             }
         }
         let mut cur = n.walk();
         for ch in n.named_children(&mut cur) {
-            search(ch, src, name, out);
+            search(ch, src, name, found, depth + 1);
         }
     }
-    let mut out = None;
-    search(host, src, name, &mut out);
-    out
+    let mut found = Vec::new();
+    search(host, src, name, &mut found, 0);
+    match found.len() {
+        0 => None,
+        1 => Some(DeclLookup::Unique(found.remove(0))),
+        _ => Some(DeclLookup::Ambiguous(found.remove(0))),
+    }
 }
 
 /// The return type implied by what the call's RESULT is used for.
@@ -192,10 +220,14 @@ fn return_type(call: Node, src: &str) -> String {
         // `f();` as a statement — nothing wants a value.
         "expression_statement" => "void".to_string(),
         // `int x = f();` — the declaration's own type.
+        // `char *p = f();` is `char *`, not `char`: the pointer lives in the DECLARATOR, and
+        // dropping it generated a function whose return type could not be assigned.
         "init_declarator" => parent
             .parent()
-            .and_then(|d| d.child_by_field_name("type"))
-            .map(|t| text_of(t, src))
+            .and_then(|d| {
+                let base = d.child_by_field_name("type").map(|t| text_of(t, src))?;
+                Some(format!("{base}{}", pointer_suffix(parent)))
+            })
             .unwrap_or_else(|| "int".to_string()),
         // `x = f();` — whatever x is, which we cannot see from here without scope; `int` is the
         // honest default and the assignment will flag a mismatch immediately if wrong.
@@ -325,6 +357,59 @@ mod tests {
         let p = plan(src, at(src, "handle"), &none).unwrap();
         assert!(p.guessed_types, "an unknown call's type cannot be known");
         assert!(p.text.contains("TODO: check the generated parameter types"), "{}", p.text);
+    }
+
+    // --- regressions found by adversarial review ---------------------------------------------
+
+    #[test]
+    fn pointer_return_types_survive() {
+        // Was: `char *p = f();` generated `static char f(...)`, which cannot be assigned.
+        let src = "void run(void)\n{\n    char *p = grab();\n}\n";
+        let p = plan(src, at(src, "grab"), &none).unwrap();
+        assert!(p.text.contains("static char * grab") || p.text.contains("static char *grab"), "{}", p.text);
+    }
+
+    #[test]
+    fn duplicate_argument_names_are_deduplicated() {
+        // Was: `f(n, n)` emitted two parameters called `n` — does not compile.
+        let src = "void run(void)\n{\n    int n = 0;\n    f(n, n);\n}\n";
+        let p = plan(src, at(src, "f(n"), &none).unwrap();
+        let sig = p.text.lines().find(|l| l.contains("f(")).unwrap();
+        let names: Vec<&str> = sig
+            .split('(')
+            .nth(1)
+            .unwrap()
+            .trim_end_matches(')')
+            .split(',')
+            .map(|x| x.trim().rsplit([' ', '*']).next().unwrap())
+            .collect();
+        assert_eq!(names.len(), 2);
+        assert_ne!(names[0], names[1], "duplicate parameter names: {sig}");
+    }
+
+    #[test]
+    fn a_hex_literal_ending_in_f_is_an_int() {
+        // Was: `0x1f` classified as a double because it ends in `f`.
+        let src = "void run(void)\n{\n    mask(0x1f);\n}\n";
+        let p = plan(src, at(src, "mask"), &none).unwrap();
+        assert!(p.text.contains("mask(int a1)"), "{}", p.text);
+    }
+
+    #[test]
+    fn a_shadowed_argument_type_is_marked_as_a_guess() {
+        // Was: the FIRST declaration anywhere in the function won, silently, even when another
+        // declaration of the same name is the one actually in scope at the call.
+        let src = "void run(void)\n{\n    {\n        char v = 0;\n    }\n    long v = 0;\n    take(v);\n}\n";
+        let p = plan(src, at(src, "take"), &none).unwrap();
+        assert!(p.guessed_types, "an ambiguous name must not be reported as certain: {}", p.text);
+    }
+
+    #[test]
+    fn an_error_elsewhere_in_the_file_does_not_disable_the_action() {
+        // Was: has_error was checked on the whole file, so one broken function (or C++ in the
+        // same header) silently disabled create-from-usage everywhere.
+        let src = "void broken( ;\n\nvoid run(void)\n{\n    helper(1);\n}\n";
+        assert!(plan(src, at(src, "helper"), &none).is_some(), "a clean host must still work");
     }
 
     #[test]

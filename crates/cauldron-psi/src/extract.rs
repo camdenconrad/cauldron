@@ -69,6 +69,17 @@ pub enum ExtractError {
     UnknownType(String),
     /// The selection is empty, or the file does not parse as C.
     Empty,
+    /// A name is declared more than once in this function (shadowing). The scope model is one
+    /// flat map, so it cannot tell the two apart — and getting it wrong silently rebinds the
+    /// extracted body to the wrong variable, or to a global of the same name.
+    Shadowed(String),
+    /// The selection (or the function) takes the address of a local. `&x` is how C passes
+    /// out-parameters, and a value written only through its address looks exactly like a
+    /// read-only use — so passing it by value would silently drop the write.
+    AddressTaken(String),
+    /// A declarator shape whose type cannot be reproduced faithfully: arrays, function pointers,
+    /// anything where the type is not `base` plus stars.
+    ComplexDeclarator(String),
     /// The enclosing function did not parse cleanly. Refusing is the only safe answer: every
     /// decision below reads types and names off the tree, and a misparse (C++ in a `.h`, an
     /// unexpanded macro, a syntax error mid-edit) makes all of them fiction. This was found by
@@ -90,6 +101,15 @@ impl std::fmt::Display for ExtractError {
             }
             Self::UnknownType(n) => write!(f, "cannot determine the type of `{n}`"),
             Self::Empty => write!(f, "nothing to extract"),
+            Self::Shadowed(n) => {
+                write!(f, "`{n}` is declared more than once here — rename one before extracting")
+            }
+            Self::AddressTaken(n) => {
+                write!(f, "`&{n}` is taken — the value may be written through the pointer")
+            }
+            Self::ComplexDeclarator(n) => {
+                write!(f, "cannot reproduce the declared type of `{n}` (array or function pointer)")
+            }
             Self::Unparseable => write!(f, "this function does not parse as C — cannot extract safely"),
         }
     }
@@ -119,6 +139,11 @@ pub fn plan(src: &str, sel: Range<usize>, name: &str) -> Result<ExtractPlan, Ext
     // Snap to whole statements within the INNERMOST block containing the selection, so a run
     // inside a loop or an `if` body extracts as readily as one at the function's top level.
     let block = enclosing(root, sel.start, "compound_statement").unwrap_or(body);
+    // A selection that starts inside an inner block and ends outside it used to extract only the
+    // inner part, silently dropping the rest of what the user highlighted.
+    if sel.end > block.end_byte() {
+        return Err(ExtractError::NotStatements);
+    }
     let stmts = statements_in(block, &sel);
     if stmts.is_empty() {
         return Err(ExtractError::NotStatements);
@@ -135,8 +160,22 @@ pub fn plan(src: &str, sel: Range<usize>, name: &str) -> Result<ExtractPlan, Ext
     // Declarations visible in the function: parameters, then every local declaration, each with
     // the byte at which it comes into scope.
     let mut scope: BTreeMap<String, (String, usize)> = BTreeMap::new();
-    collect_params(func, src, &mut scope);
-    collect_locals(body, src, &mut scope);
+    let mut duplicates: BTreeSet<String> = BTreeSet::new();
+    let mut complex: BTreeSet<String> = BTreeSet::new();
+    collect_params(func, src, &mut scope, &mut duplicates, &mut complex);
+    collect_locals(body, src, &mut scope, &mut duplicates, &mut complex);
+    // Shadowing anywhere in the function makes the flat scope map unreliable for EVERY name in
+    // it (a later declaration overwrote an earlier one's type and position), so this refuses on
+    // the function, not just on the shadowed name reaching the selection.
+    if let Some(n) = duplicates.iter().next() {
+        return Err(ExtractError::Shadowed(n.clone()));
+    }
+    // `&x` on anything declared in this function: the value may be written through the pointer,
+    // and a read-only `&x` (printf("%p", &x)) is indistinguishable from a writing one, so both
+    // are refused rather than one silently passed by value.
+    if let Some(n) = address_taken_local(body, src, &scope) {
+        return Err(ExtractError::AddressTaken(n));
+    }
 
     // Identifiers the selection mentions, and which of them it assigns to. `used` keeps SOURCE
     // ORDER: a parameter list that reads in the order the body mentions them is what a human
@@ -167,6 +206,9 @@ pub fn plan(src: &str, sel: Range<usize>, name: &str) -> Result<ExtractPlan, Ext
         if ty.is_empty() {
             return Err(ExtractError::UnknownType(n.clone()));
         }
+        if complex.contains(n) {
+            return Err(ExtractError::ComplexDeclarator(n.clone()));
+        }
         params.push(Param { name: n.clone(), ty: ty.clone() });
     }
 
@@ -187,6 +229,9 @@ pub fn plan(src: &str, sel: Range<usize>, name: &str) -> Result<ExtractPlan, Ext
         if ty.is_empty() {
             return Err(ExtractError::UnknownType(n.clone()));
         }
+        if complex.contains(n) {
+            return Err(ExtractError::ComplexDeclarator(n.clone()));
+        }
         // A variable that is BOTH an input and written is fine only if it is the single output;
         // otherwise it would need an out-param.
         outputs.push(Param { name: n.clone(), ty: ty.clone() });
@@ -204,6 +249,9 @@ pub fn plan(src: &str, sel: Range<usize>, name: &str) -> Result<ExtractPlan, Ext
     }
 
     let indent = line_indent(src, span.start);
+    // Match the file's line endings. `str::lines()` eats `\r`, so a CRLF file was getting
+    // LF-only generated text spliced into it — mixed endings that git and every diff tool notice.
+    let nl = if src.contains("\r\n") { "\r\n" } else { "\n" };
     let ret_ty = returns.as_ref().map_or("void", |r| r.ty.as_str());
     let sig_params = match params.is_empty() {
         true => "void".to_string(),
@@ -216,23 +264,23 @@ pub fn plan(src: &str, sel: Range<usize>, name: &str) -> Result<ExtractPlan, Ext
 
     // The body: the selected text, re-indented one level in from the new function's own column.
     let selected = &src[span.clone()];
-    let body_text = reindent(selected, &indent, "    ");
+    let body_text = reindent(selected, &indent, "    ", nl);
     let mut function_text = String::new();
     let name_start;
     function_text.push_str(&format!("{ret_ty} "));
     name_start = function_text.len();
     function_text.push_str(name);
-    function_text.push_str(&format!("({sig_params})\n{{\n"));
+    function_text.push_str(&format!("({sig_params}){nl}{{{nl}"));
     // A returned local is DECLARED inside the moved statements already; one that came in as a
     // parameter is not re-declared.
     function_text.push_str(&body_text);
     if !function_text.ends_with('\n') {
-        function_text.push('\n');
+        function_text.push_str(nl);
     }
     if let Some(r) = &returns {
-        function_text.push_str(&format!("    return {};\n", r.name));
+        function_text.push_str(&format!("    return {};{nl}", r.name));
     }
-    function_text.push_str("}\n\n");
+    function_text.push_str(&format!("}}{nl}{nl}"));
 
     let args = params.iter().map(|p| p.name.as_str()).collect::<Vec<_>>().join(", ");
     let call = match &returns {
@@ -280,32 +328,49 @@ fn statements_in<'t>(body: Node<'t>, sel: &Range<usize>) -> Vec<Node<'t>> {
 /// `break`/`continue` are only escaping when they are NOT inside a loop/switch that is itself
 /// part of the selection — a self-contained `for` carries its own.
 fn escaping_control_flow(n: Node) -> Option<&'static str> {
-    fn walk(n: Node, loop_depth: usize) -> Option<&'static str> {
+    fn walk(n: Node, loops: usize, breakables: usize, depth: usize) -> Option<&'static str> {
+        if depth > MAX_DEPTH {
+            return None;
+        }
         let kind = n.kind();
-        let inner = matches!(
-            kind,
-            "for_statement" | "while_statement" | "do_statement" | "switch_statement"
-        );
+        // `switch` catches `break` but NOT `continue` — a `continue` inside a switch belongs to
+        // the enclosing LOOP, so a selection of just the switch does not carry it. Counting them
+        // together generated a `continue` with no loop around it: code that does not compile.
+        let is_loop = matches!(kind, "for_statement" | "while_statement" | "do_statement");
+        let is_breakable = is_loop || kind == "switch_statement";
         match kind {
             "return_statement" => return Some("return"),
             "goto_statement" => return Some("goto"),
-            "break_statement" if loop_depth == 0 => return Some("break"),
-            "continue_statement" if loop_depth == 0 => return Some("continue"),
+            // A label whose `goto` lives outside the selection would be moved away from it.
+            "labeled_statement" => return Some("label"),
+            "break_statement" if breakables == 0 => return Some("break"),
+            "continue_statement" if loops == 0 => return Some("continue"),
             _ => {}
         }
         let mut cur = n.walk();
         for ch in n.named_children(&mut cur) {
-            if let Some(k) = walk(ch, loop_depth + usize::from(inner)) {
+            if let Some(k) = walk(
+                ch,
+                loops + usize::from(is_loop),
+                breakables + usize::from(is_breakable),
+                depth + 1,
+            ) {
                 return Some(k);
             }
         }
         None
     }
-    walk(n, 0)
+    walk(n, 0, 0, 0)
 }
 
 /// Parameters of `func` into `scope`, in scope from the body's start.
-fn collect_params(func: Node, src: &str, scope: &mut BTreeMap<String, (String, usize)>) {
+fn collect_params(
+    func: Node,
+    src: &str,
+    scope: &mut BTreeMap<String, (String, usize)>,
+    duplicates: &mut BTreeSet<String>,
+    complex: &mut BTreeSet<String>,
+) {
     let Some(d) = func.child_by_field_name("declarator") else { return };
     let Some(params) = d.child_by_field_name("parameters") else { return };
     let at = func.start_byte();
@@ -314,32 +379,139 @@ fn collect_params(func: Node, src: &str, scope: &mut BTreeMap<String, (String, u
         if p.kind() != "parameter_declaration" {
             continue;
         }
+        let Some(pd) = p.child_by_field_name("declarator") else { continue };
         if let Some((name, ty)) = decl_name_and_type(p, src) {
-            scope.insert(name, (ty, at));
+            if !faithful_declarator(pd) {
+                complex.insert(name.clone());
+            }
+            if scope.insert(name.clone(), (ty, at)).is_some() {
+                duplicates.insert(name);
+            }
         }
     }
 }
 
-/// Every local `declaration` anywhere in `body`, with the byte it becomes visible at.
-fn collect_locals(body: Node, src: &str, scope: &mut BTreeMap<String, (String, usize)>) {
-    fn walk(n: Node, src: &str, scope: &mut BTreeMap<String, (String, usize)>) {
-        if n.kind() == "declaration" {
-            let ty = n.child_by_field_name("type").map(|t| node_text(t, src)).unwrap_or_default();
-            let mut cur = n.walk();
-            for d in n.children_by_field_name("declarator", &mut cur) {
-                if let Some(name) = declarator_name(d, src) {
-                    let full = format!("{ty}{}", pointer_suffix(d));
-                    scope.insert(name, (full, n.start_byte()));
+/// The first local whose address is taken anywhere in the function, if any.
+fn address_taken_local(
+    body: Node,
+    src: &str,
+    scope: &BTreeMap<String, (String, usize)>,
+) -> Option<String> {
+    fn walk(
+        n: Node,
+        src: &str,
+        scope: &BTreeMap<String, (String, usize)>,
+        depth: usize,
+    ) -> Option<String> {
+        if depth > MAX_DEPTH {
+            return None;
+        }
+        if n.kind() == "pointer_expression" && src[n.byte_range()].starts_with('&') {
+            if let Some(base) = n.named_child(0).and_then(|c| base_identifier(c, src)) {
+                if scope.contains_key(&base) {
+                    return Some(base);
                 }
             }
         }
         let mut cur = n.walk();
         for ch in n.named_children(&mut cur) {
-            walk(ch, src, scope);
+            if let Some(f) = walk(ch, src, scope, depth + 1) {
+                return Some(f);
+            }
+        }
+        None
+    }
+    walk(body, src, scope, 0)
+}
+
+/// Every local `declaration` anywhere in `body`, with the byte it becomes visible at.
+///
+/// The map is FLAT — one entry per name for the whole function. That is only sound because
+/// [`plan`] refuses any function where a name is declared twice: with block scoping unmodelled, a
+/// later sibling-block `int v` would overwrite an outer `long v`'s type AND its scope-entry byte,
+/// which silently changed a parameter's type or dropped it entirely. Rather than model C's scopes,
+/// the engine declines; `duplicates` is how it knows to.
+fn collect_locals(
+    body: Node,
+    src: &str,
+    scope: &mut BTreeMap<String, (String, usize)>,
+    duplicates: &mut BTreeSet<String>,
+    complex: &mut BTreeSet<String>,
+) {
+    fn walk(
+        n: Node,
+        src: &str,
+        scope: &mut BTreeMap<String, (String, usize)>,
+        duplicates: &mut BTreeSet<String>,
+        complex: &mut BTreeSet<String>,
+        depth: usize,
+    ) {
+        if depth > MAX_DEPTH {
+            return;
+        }
+        if n.kind() == "declaration" {
+            let ty = declared_type(n, src);
+            let mut cur = n.walk();
+            for d in n.children_by_field_name("declarator", &mut cur) {
+                if let Some(name) = declarator_name(d, src) {
+                    if !faithful_declarator(d) {
+                        complex.insert(name.clone());
+                    }
+                    let full = format!("{ty}{}", pointer_suffix(d));
+                    if scope.insert(name.clone(), (full, n.start_byte())).is_some() {
+                        duplicates.insert(name);
+                    }
+                }
+            }
+        }
+        let mut cur = n.walk();
+        for ch in n.named_children(&mut cur) {
+            walk(ch, src, scope, duplicates, complex, depth + 1);
         }
     }
-    walk(body, src, scope);
+    walk(body, src, scope, duplicates, complex, 0);
 }
+
+/// The full declared type of a `declaration` / `parameter_declaration`, INCLUDING qualifiers.
+/// `const char *p` must not come back as `char *`: dropping `const` changes the contract, and the
+/// generated function would then fail to compile against a const argument.
+fn declared_type(n: Node, src: &str) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    let mut cur = n.walk();
+    for ch in n.named_children(&mut cur) {
+        match ch.kind() {
+            "type_qualifier" => parts.push(node_text(ch, src)),
+            _ if Some(ch) == n.child_by_field_name("type") => parts.push(node_text(ch, src)),
+            _ => {}
+        }
+    }
+    parts.join(" ")
+}
+
+/// Can [`pointer_suffix`] reproduce this declarator's type exactly? Only `base` + stars. An array
+/// (`int a[10]`) decays to a pointer when passed, and a function pointer's type cannot be written
+/// as a suffix at all — both silently change the parameter's meaning.
+fn faithful_declarator(d: Node) -> bool {
+    let mut cur = d;
+    loop {
+        match cur.kind() {
+            "identifier" => return true,
+            "array_declarator" | "function_declarator" | "parenthesized_declarator" => return false,
+            "pointer_declarator" | "init_declarator" | "attributed_declarator" => {
+                match cur.child_by_field_name("declarator") {
+                    Some(next) => cur = next,
+                    None => return false,
+                }
+            }
+            _ => return false,
+        }
+    }
+}
+
+/// Guard on every recursive walk. Ordinary generated C (deeply nested initializers, long
+/// else-if chains) can nest thousands deep, and an unbounded walk ABORTS the process on stack
+/// overflow rather than panicking — an editor must not die because a file is unusual.
+const MAX_DEPTH: usize = 400;
 
 /// Names declared by `declaration` nodes within this subtree.
 fn collect_declared_names(n: Node, src: &str, out: &mut BTreeSet<String>) {
@@ -479,16 +651,26 @@ fn line_indent(src: &str, byte: usize) -> String {
 }
 
 /// Re-indent a block that currently sits at `from` to sit at `to`.
-fn reindent(text: &str, from: &str, to: &str) -> String {
-    text.lines()
-        .map(|l| match l.strip_prefix(from) {
-            Some(rest) => format!("{to}{rest}"),
-            // A line indented less than the block's own first line (a label, a closing brace of
-            // an outer construct) is left where it is rather than mangled.
-            None => l.trim_start().is_empty().then(String::new).unwrap_or_else(|| format!("{to}{}", l.trim_start())),
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
+fn reindent(text: &str, from: &str, to: &str, nl: &str) -> String {
+    let mut out: Vec<String> = Vec::new();
+    let mut continued = false;
+    for l in text.split('\n') {
+        let l = l.strip_suffix('\r').unwrap_or(l);
+        // A backslash-continued line's SUCCESSOR is part of a token (a string literal, a macro
+        // body). Re-indenting it changes the value, so continuation lines pass through verbatim.
+        let next_continued = l.ends_with('\\');
+        if continued {
+            out.push(l.to_string());
+        } else if let Some(rest) = l.strip_prefix(from) {
+            out.push(format!("{to}{rest}"));
+        } else if l.trim().is_empty() {
+            out.push(String::new());
+        } else {
+            out.push(format!("{to}{}", l.trim_start()));
+        }
+        continued = next_continued;
+    }
+    out.join(nl)
 }
 
 #[cfg(test)]
@@ -500,6 +682,113 @@ mod tests {
     fn span(src: &str, needle: &str) -> Range<usize> {
         let s = src.find(needle).expect("fixture");
         s..s + needle.len()
+    }
+
+    // --- refusals found by adversarial review; each one was silently wrong code -------------
+
+    #[test]
+    fn refuses_when_a_later_sibling_block_shadows_a_name() {
+        // Was: the inner `int v` overwrote the outer entry INCLUDING its scope byte, so `v` was
+        // dropped as a parameter and the moved body rebound to the file-scope `v` — different
+        // value, compiles clean.
+        let src = "int v = 99;\nvoid run(void)\n{\n    int v = 1;\n    use(v);\n    {\n        int v = 2;\n        use(v);\n    }\n}\n";
+        let s = src.find("    use(v);").unwrap();
+        assert_eq!(
+            plan(src, s..s + "    use(v);".len(), "h").unwrap_err(),
+            ExtractError::Shadowed("v".into())
+        );
+    }
+
+    #[test]
+    fn refuses_when_shadowing_would_give_the_wrong_type() {
+        // Was: `char v` overwrote `long v`, so the parameter and return became char and the
+        // arithmetic silently truncated.
+        let src = "void run(void)\n{\n    long v = 200;\n    {\n        char v = 'a';\n        use(v);\n    }\n    v = v + 100;\n    print(v);\n}\n";
+        let s = src.find("    v = v + 100;").unwrap();
+        assert!(matches!(
+            plan(src, s..s + "    v = v + 100;".len(), "h"),
+            Err(ExtractError::Shadowed(_))
+        ));
+    }
+
+    #[test]
+    fn refuses_when_an_address_is_taken() {
+        // Was: `x` looked like a pure read, so it was passed BY VALUE and scanf wrote the
+        // callee's copy. This is every out-parameter idiom in C.
+        let src = "void run(void)\n{\n    int x = 0;\n    scanf(\"%d\", &x);\n    print(x);\n}\n";
+        let s = src.find("    scanf").unwrap();
+        let e = src[s..].find('\n').unwrap() + s;
+        assert_eq!(plan(src, s..e, "h").unwrap_err(), ExtractError::AddressTaken("x".into()));
+    }
+
+    #[test]
+    fn refuses_an_array_local_that_would_decay() {
+        // Was: `int a[10]` became parameter `int a`, silently changing the type.
+        let src = "void run(void)\n{\n    int a[10];\n    use(a);\n}\n";
+        let s = src.find("    use(a);").unwrap();
+        assert_eq!(
+            plan(src, s..s + "    use(a);".len(), "h").unwrap_err(),
+            ExtractError::ComplexDeclarator("a".into())
+        );
+    }
+
+    #[test]
+    fn continue_inside_a_switch_still_belongs_to_the_loop() {
+        // Was: `switch` was counted as carrying `continue`, so selecting just the switch produced
+        // a `continue` with no loop around it — code that does not compile.
+        let src = "void run(void)\n{\n    for (int i = 0; i < 3; i++) {\n        switch (i) {\n        case 1:\n            continue;\n        }\n    }\n}\n";
+        let needle = "switch (i) {\n        case 1:\n            continue;\n        }";
+        let s = src.find(needle).unwrap();
+        assert_eq!(
+            plan(src, s..s + needle.len(), "h").unwrap_err(),
+            ExtractError::EscapingControlFlow("continue")
+        );
+    }
+
+    #[test]
+    fn refuses_a_selection_that_escapes_its_block() {
+        // Was: only the inner part was extracted, silently dropping the rest of the highlight.
+        let src = "void run(int x)\n{\n    if (x) {\n        a();\n    }\n    b();\n}\n";
+        let s = src.find("        a();").unwrap();
+        let e = src.find("    b();").unwrap() + "    b();".len();
+        assert_eq!(plan(src, s..e, "h").unwrap_err(), ExtractError::NotStatements);
+    }
+
+    #[test]
+    fn qualifiers_survive_into_the_parameter_type() {
+        // Was: `const` was dropped, so the generated function would not compile against a
+        // const argument.
+        let src = "void run(void)\n{\n    const int k = 1;\n    use(k);\n}\n";
+        let s = src.find("    use(k);").unwrap();
+        let p = plan(src, s..s + "    use(k);".len(), "h").unwrap();
+        assert_eq!(p.params[0].ty, "const int", "{:?}", p.params);
+    }
+
+    #[test]
+    fn crlf_files_get_crlf_output() {
+        // Was: str::lines() ate the \r, splicing LF-only text into a CRLF file.
+        let src = "void run(void)\r\n{\r\n    int a = 0;\r\n    use(a);\r\n}\r\n";
+        let s = src.find("    use(a);").unwrap();
+        let p = plan(src, s..s + "    use(a);".len(), "h").unwrap();
+        assert!(p.function_text.contains("\r\n"), "{:?}", p.function_text);
+        assert!(!p.function_text.replace("\r\n", "").contains('\n'), "no bare LF: {:?}", p.function_text);
+    }
+
+    #[test]
+    fn deep_nesting_does_not_blow_the_stack() {
+        // Unbounded recursion ABORTS the process rather than panicking; an editor must not die
+        // because a generated file is 2000 blocks deep.
+        let mut src = String::from("void run(void)\n{\n");
+        for _ in 0..2000 {
+            src.push_str("    {\n");
+        }
+        src.push_str("    use(1);\n");
+        for _ in 0..2000 {
+            src.push_str("    }\n");
+        }
+        src.push_str("}\n");
+        let s = src.find("    use(1);").unwrap();
+        let _ = plan(&src, s..s + 11, "h"); // must return, not abort
     }
 
     #[test]
