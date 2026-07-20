@@ -64,6 +64,7 @@ pub enum Command {
     InstallDependencies,
     // View
     ToggleTerminal,
+    SwitchHeaderSource,
     ToggleProjectPanel,
     MarkdownPreview,
     WebPreview,
@@ -113,6 +114,7 @@ pub const COMMANDS: &[(Command, &str, &str)] = &[
     (Command::StopRun, "Stop", "Ctrl+F2"),
     (Command::InstallDependencies, "Install Dependencies", ""),
     (Command::ToggleTerminal, "Toggle Terminal", "Alt+F12"),
+    (Command::SwitchHeaderSource, "Switch Header/Source", "Ctrl+Alt+Home"),
     (Command::ToggleProjectPanel, "Toggle Project Panel", "Alt+1"),
     (Command::MarkdownPreview, "Toggle Markdown Preview", ""),
     (Command::WebPreview, "Open Web Preview in Browser (live)", ""),

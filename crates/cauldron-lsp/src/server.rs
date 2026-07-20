@@ -57,6 +57,8 @@ pub(crate) enum PendingKind {
     PrepareCallHierarchy { generation: u64 },
     IncomingCalls { generation: u64 },
     WorkspaceSymbols { generation: u64 },
+    /// clangd's `textDocument/switchSourceHeader` extension — the counterpart of a .c/.h pair.
+    SwitchSourceHeader { from: PathBuf },
     PullDiagnostics { path: PathBuf, version: i32 },
     /// A request whose response carries nothing we act on (e.g. `workspace/executeCommand` —
     /// any resulting edits arrive separately as a server→client `workspace/applyEdit`).
@@ -492,6 +494,14 @@ fn route(
             PendingKind::SignatureHelp { generation } => {
                 let help = serde_json::from_value::<lsp_types::SignatureHelp>(result).ok();
                 emit(events, notifier, id, Raw::Lsp(LspEvent::SignatureHelp { generation, help }));
+            }
+            PendingKind::SwitchSourceHeader { from } => {
+                // A bare URI string, or null when clangd knows of no counterpart.
+                let to = result
+                    .as_str()
+                    .and_then(|u| lsp_types::Url::parse(u).ok())
+                    .and_then(|u| u.to_file_path().ok());
+                emit(events, notifier, id, Raw::Lsp(LspEvent::SwitchSourceHeader { from, to }));
             }
             PendingKind::DocumentSymbols { generation, path } => {
                 // Nested DocumentSymbol[] (modern) or flat SymbolInformation[] (legacy) — both.

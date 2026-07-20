@@ -311,6 +311,29 @@ impl LspManager {
         );
     }
 
+    /// clangd's `textDocument/switchSourceHeader` extension: given `foo.c`, answer `foo.h` (and
+    /// vice versa). clangd resolves this through the COMPILATION DATABASE, so it finds the
+    /// counterpart across dissimilar `src/` and `include/` trees, which a filename guess cannot.
+    /// Answers as [`LspEvent::SwitchSourceHeader`]; a server without the extension simply errors
+    /// and the app falls back.
+    pub fn request_switch_source_header(&mut self, path: &Path) -> bool {
+        // Clangd-only: the extension does not exist elsewhere, and an unknown method on another
+        // server is just a wasted round trip ending in an error.
+        if self.docs_index.get(path).map(|(k, _)| *k) != Some(ServerKind::Clangd) {
+            return false;
+        }
+        let Some(server) = self.server_for_mut(path) else { return false };
+        if !matches!(server.state, ServerState::Ready | ServerState::Indexing(_)) {
+            return false;
+        }
+        server.request(
+            "textDocument/switchSourceHeader",
+            json!({"uri": uri_of(path)}),
+            PendingKind::SwitchSourceHeader { from: path.to_path_buf() },
+        );
+        true
+    }
+
     /// `textDocument/documentSymbol` — the whole file's symbol tree.
     pub fn request_document_symbols(&mut self, path: &Path, generation: u64) {
         let Some(server) = self.server_for_mut(path) else { return };

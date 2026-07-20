@@ -55,9 +55,13 @@ fn debounce() -> Duration {
         AiProvider::Ollama => DEBOUNCE_LOCAL,
     }
 }
-/// Context sent around the caret (chars). Generous but bounded — this fires often.
-const PREFIX_CHARS: usize = 6000;
-const SUFFIX_CHARS: usize = 2000;
+/// Context sent around the caret (chars). Kept TIGHT on purpose: this is the dominant term in
+/// how long a ghost takes to appear, since the model must read every character of it before
+/// emitting its first token. 8000 chars was several seconds of pure prompt processing on a local
+/// model. Inline completion is a locality problem — the nearby lines carry almost all the signal,
+/// and the far end of a long file was paying for itself many times a minute.
+const PREFIX_CHARS: usize = 2000;
+const SUFFIX_CHARS: usize = 600;
 const MODEL: &str = "claude-haiku-4-5-20251001";
 
 /// One completed request: ghost text for (path, byte, generation).

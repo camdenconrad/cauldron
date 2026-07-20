@@ -164,6 +164,9 @@ pub struct EditorView {
     /// AI inline (ghost) completion pinned to a caret byte + buffer generation. Cleared the
     /// moment either drifts. Tab accepts, Esc dismisses.
     ghost: Option<Ghost>,
+    /// A ghost was accepted with Tab this frame; the app must not also let the completion popup
+    /// consume that same Tab. Drained by [`Self::take_ghost_accepted`].
+    ghost_accepted: bool,
     /// Caret blink: the time of the last caret movement/edit (blink restarts VISIBLE there,
     /// JetBrains-style) + the head position that stamp belongs to.
     blink_epoch: f64,
@@ -564,6 +567,7 @@ impl EditorView {
             context_click: None,
             caret_pos: None,
             ghost: None,
+            ghost_accepted: false,
             blink_epoch: 0.0,
             blink_head: 0,
             snippet: None,
@@ -1480,7 +1484,7 @@ impl EditorView {
         geoms: &[LineGeom],
         rope: &Rope,
         text_left: f32,
-        _row_h: f32,
+        row_h: f32,
         font: &FontId,
     ) {
         let Some(g) = &self.ghost else { return };
@@ -1490,13 +1494,27 @@ impl EditorView {
         // sub-row 0 (mid-text, wrong line).
         let (cx, cy) = Self::caret_xy(geom, Self::cidx_of(rope, geom, g.byte));
         let x = text_left + cx;
-        let mut first = g.text.lines().next().unwrap_or("").to_string();
-        let extra = g.text.lines().count().saturating_sub(1);
-        if extra > 0 {
-            first.push_str(&format!("  ⏎+{extra}"));
-        }
         const GHOST: Color32 = Color32::from_gray(118);
-        painter.text(Pos2::new(x, geom.top + cy), egui::Align2::LEFT_TOP, first, font.clone(), GHOST);
+        // EVERY line is painted. Showing only the first with a "⏎+N" counter meant Tab inserted
+        // text the user had never seen — the accepted completion looked like a different
+        // suggestion entirely. Continuation lines start at the text margin, as they will once
+        // inserted; the first is inline at the caret.
+        for (i, seg) in g.text.split('\n').enumerate() {
+            let (px, py) = match i {
+                0 => (x, geom.top + cy),
+                _ => (text_left, geom.top + cy + row_h * i as f32),
+            };
+            if seg.is_empty() {
+                continue;
+            }
+            painter.text(
+                Pos2::new(px, py),
+                egui::Align2::LEFT_TOP,
+                seg,
+                font.clone(),
+                GHOST,
+            );
+        }
     }
 
     fn paint_selections(
@@ -1773,6 +1791,13 @@ impl EditorView {
         }
     }
 
+    /// Did Tab accept a ghost during THIS frame's key handling? Read-only: the flag is reset at
+    /// the top of every `handle_keys`, so it can never leak into a later frame where the app
+    /// would wrongly suppress a real completion accept.
+    pub fn ghost_accepted(&self) -> bool {
+        self.ghost_accepted
+    }
+
     pub fn clear_ghost(&mut self) {
         self.ghost = None;
     }
@@ -1795,6 +1820,8 @@ impl EditorView {
     }
 
     fn handle_keys(&mut self, ui: &egui::Ui, buffer: &mut Buffer) {
+        // Frame-scoped (see ghost_accepted).
+        self.ghost_accepted = false;
         let now = ui.input(|i| i.time);
         let events = ui.input(|i| i.events.clone());
         for event in events {
@@ -1870,6 +1897,11 @@ impl EditorView {
             Key::Tab if self.ghost.is_some() && !m.shift => {
                 if let Some(g) = self.ghost.take() {
                     self.insert(buffer, &g.text, EditKind::Other, now);
+                    // Claim the keystroke. The completion popup reads Tab from the same frame's
+                    // input, so without this ONE Tab both accepted the ghost and committed the
+                    // popup's selection on top of it — the user saw grey text and got something
+                    // else entirely.
+                    self.ghost_accepted = true;
                 }
             }
             Key::Escape if self.ghost.is_some() => {

@@ -1848,6 +1848,25 @@ impl App {
         depsinstall::install(root, force, generation, status, move || repaint());
     }
 
+    /// Jump between a C file and its header (Ctrl+Alt+Home). clangd's `switchSourceHeader`
+    /// answers first when available — it resolves through the compilation database, so it pairs
+    /// `src/foo.c` with `include/proj/foo.h` across dissimilar trees. The filename guess is only
+    /// the fallback, for a server that is not ready, not clangd, or knows of no counterpart.
+    fn switch_header_source(&mut self) {
+        let Some(path) =
+            self.groups[self.focused].files.get(self.groups[self.focused].active).map(|f| f.path.clone())
+        else {
+            return;
+        };
+        if self.lsp.request_switch_source_header(&path) {
+            return; // answered asynchronously as LspEvent::SwitchSourceHeader
+        }
+        match counterpart_path(&path) {
+            Some(to) => self.open_file(to),
+            None => self.lsp_message = Some("no header/source counterpart found".into()),
+        }
+    }
+
     /// Stop whatever is running, from either engine — the piped build ([`runner::Runner`]) or the
     /// Run button's PTY. Both are killed unconditionally: the user pressed Stop, and asking which
     /// of the two they meant would be theatre.
@@ -3505,6 +3524,7 @@ impl App {
                 self.install_deps(true);
                 self.bottom_open = true;
             }
+            C::SwitchHeaderSource => self.switch_header_source(),
             C::ToggleTerminal => {
                 let root = self.terminal_root();
                 self.terminal.toggle(ctx, &root);
@@ -3818,6 +3838,21 @@ impl App {
                             }
                             f.view.set_inlay_hints(merged);
                         }
+                    }
+                }
+                None
+            }
+            LspEvent::SwitchSourceHeader { from, to } => {
+                // clangd resolves through the compilation database, so it crosses src/ and
+                // include/ trees a filename guess cannot. When it knows of no counterpart, fall
+                // back to the guess rather than doing nothing.
+                match to.or_else(|| counterpart_path(&from)) {
+                    Some(to) => self.open_file(to),
+                    None => {
+                        self.lsp_message = Some(format!(
+                            "no counterpart for {}",
+                            from.file_name().unwrap_or_default().to_string_lossy()
+                        ))
                     }
                 }
                 None
@@ -6546,7 +6581,13 @@ impl App {
         // meant racing the editor (which processes Enter a step earlier in the frame) via a
         // cross-frame suppress_enter flag — it ate newlines and, on a stale LSP range, dropped the
         // caret on a random line. Tab-to-accept is unambiguous and race-free.
-        let accept = ctx.input(|i| i.key_pressed(egui::Key::Tab));
+        // A Tab the editor already spent accepting a ghost is NOT also an accept here.
+        let ghost_took_tab = self
+            .groups
+            .get_mut(self.focused)
+            .and_then(|g| g.active_file())
+            .is_some_and(|f| f.view.ghost_accepted());
+        let accept = ctx.input(|i| i.key_pressed(egui::Key::Tab)) && !ghost_took_tab;
         let mut clicked: Option<usize> = None;
 
         egui::Area::new("completion".into())
@@ -7339,6 +7380,10 @@ impl eframe::App for App {
         // Ctrl+F2 = stop, JetBrains' binding. Harmless when nothing is running.
         if cmd(egui::Key::F2) {
             self.stop_run();
+        }
+        // Ctrl+Alt+Home = header/source switch, the C keystroke every IDE binds here.
+        if ctx.input(|i| i.modifiers.command && i.modifiers.alt && i.key_pressed(egui::Key::Home)) {
+            self.switch_header_source();
         }
         // Editor zoom (Ctrl+± / Ctrl+0) — EDITOR-ONLY; the whole-UI zoom lives in Settings.
         let mut font_delta = 0.0f32;
@@ -10490,6 +10535,51 @@ fn to_view_diags(diags: &[lsp_types::Diagnostic], rope: &Rope, enc: Encoding) ->
         .collect()
 }
 
+/// The on-disk counterpart of a C/C++ source or header, by filename. Tries the sibling directory
+/// first, then the conventional `src/` ↔ `include/` swap that clangd would resolve properly given
+/// a compilation database. Returns only paths that EXIST — a guess pointing at nothing is worse
+/// than saying so.
+fn counterpart_path(path: &Path) -> Option<PathBuf> {
+    const SOURCE: &[&str] = &["c", "cc", "cpp", "cxx", "c++", "m", "mm"];
+    const HEADER: &[&str] = &["h", "hh", "hpp", "hxx", "h++", "inc"];
+    let ext = path.extension()?.to_str()?.to_ascii_lowercase();
+    let targets: &[&str] = match () {
+        _ if SOURCE.contains(&ext.as_str()) => HEADER,
+        _ if HEADER.contains(&ext.as_str()) => SOURCE,
+        _ => return None,
+    };
+    let dir = path.parent()?;
+    // Sibling first — the overwhelmingly common layout, and the cheapest to check.
+    for t in targets {
+        let cand = path.with_extension(t);
+        if cand != path && cand.is_file() {
+            return Some(cand);
+        }
+    }
+    // Then the src/include split. Walk up from the file's directory swapping the first matching
+    // component, so nested trees (src/net/foo.c -> include/net/foo.h) still pair up.
+    let stem = path.file_stem()?;
+    for (from, to) in [("src", "include"), ("include", "src"), ("source", "include")] {
+        let swapped: PathBuf = dir
+            .components()
+            .map(|c| match c.as_os_str() == from {
+                true => std::ffi::OsString::from(to),
+                false => c.as_os_str().to_os_string(),
+            })
+            .collect();
+        if swapped == dir {
+            continue;
+        }
+        for t in targets {
+            let cand = swapped.join(stem).with_extension(t);
+            if cand.is_file() {
+                return Some(cand);
+            }
+        }
+    }
+    None
+}
+
 /// The identifier span touching `byte`, or an empty range when the caret is not on a word.
 /// Servers answer an EMPTY code-action range with nothing (see the clangd live test), so every
 /// caret-driven request widens through here first.
@@ -10628,6 +10718,53 @@ mod hover_and_fix_tests {
 
     fn r(s: &str) -> Rope {
         Rope::from_str(s)
+    }
+
+    /// A scratch directory unique to this process + call. No tempfile dep in this workspace, and
+    /// three tests do not justify adding one.
+    fn scratch(tag: &str) -> PathBuf {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static N: AtomicU32 = AtomicU32::new(0);
+        let d = std::env::temp_dir().join(format!(
+            "cauldron-t-{}-{tag}-{}",
+            std::process::id(),
+            N.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    #[test]
+    fn counterpart_prefers_the_sibling_header() {
+        let d = scratch("sibling");
+        let c = d.join("foo.c");
+        let h = d.join("foo.h");
+        std::fs::write(&c, "").unwrap();
+        std::fs::write(&h, "").unwrap();
+        assert_eq!(counterpart_path(&c), Some(h.clone()));
+        assert_eq!(counterpart_path(&h), Some(c), "and back again");
+    }
+
+    #[test]
+    fn counterpart_crosses_the_src_include_split() {
+        let d = scratch("split");
+        std::fs::create_dir_all(d.join("src/net")).unwrap();
+        std::fs::create_dir_all(d.join("include/net")).unwrap();
+        let c = d.join("src/net/sock.c");
+        let h = d.join("include/net/sock.h");
+        std::fs::write(&c, "").unwrap();
+        std::fs::write(&h, "").unwrap();
+        assert_eq!(counterpart_path(&c), Some(h), "nested tree must still pair up");
+    }
+
+    #[test]
+    fn counterpart_is_none_when_nothing_exists() {
+        let d = scratch("lonely");
+        let c = d.join("lonely.c");
+        std::fs::write(&c, "").unwrap();
+        // A guess pointing at a nonexistent file is worse than admitting there is none.
+        assert_eq!(counterpart_path(&c), None);
+        assert_eq!(counterpart_path(&d.join("notes.txt")), None, "non-C file");
     }
 
     #[test]

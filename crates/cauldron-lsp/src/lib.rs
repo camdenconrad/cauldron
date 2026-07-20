@@ -117,6 +117,9 @@ pub enum LspEvent {
         version: i32,
         diags: Vec<lsp_types::Diagnostic>,
     },
+    /// clangd resolved a header/source counterpart. `to` is `None` when it knows of none —
+    /// the app falls back to its own extension-swap guess.
+    SwitchSourceHeader { from: PathBuf, to: Option<PathBuf> },
     /// Server asked every open doc to be re-pulled (`workspace/diagnostic/refresh`).
     PullAllDiagnostics,
     /// Lifecycle / indexing progress for the status bar.
