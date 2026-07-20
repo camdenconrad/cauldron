@@ -65,6 +65,8 @@ pub enum Command {
     // View
     ToggleTerminal,
     SwitchHeaderSource,
+    ExtractVariable,
+    CompleteStatement,
     HighlightUsagesInFile,
     LastEditLocation,
     RevealInProject,
@@ -123,6 +125,8 @@ pub const COMMANDS: &[(Command, &str, &str)] = &[
     (Command::InstallDependencies, "Install Dependencies", ""),
     (Command::ToggleTerminal, "Toggle Terminal", "Alt+F12"),
     (Command::SwitchHeaderSource, "Switch Header/Source", "Ctrl+Alt+Home"),
+    (Command::ExtractVariable, "Extract Variable", "Ctrl+Alt+V"),
+    (Command::CompleteStatement, "Complete Current Statement", "Ctrl+Shift+Enter"),
     (Command::HighlightUsagesInFile, "Highlight Usages in File", "Ctrl+Shift+F7"),
     (Command::LastEditLocation, "Last Edit Location", "Ctrl+Shift+Backspace"),
     (Command::RevealInProject, "Select in Project View", "Alt+F1"),

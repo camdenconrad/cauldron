@@ -1955,6 +1955,117 @@ impl EditorView {
         }
     }
 
+    /// Ctrl+Alt+V: pull the selected expression out into a new local declared on its own line
+    /// above, and replace the selection with the new name. Returns the byte range of the inserted
+    /// NAME so the caller can start an inline rename on it — you almost always want to name it
+    /// something other than the placeholder.
+    ///
+    /// Requires a selection: inferring the "expression under the caret" is exactly the guess that
+    /// makes this refactoring feel unsafe, and a wrong guess silently restructures code.
+    pub fn extract_variable(
+        &mut self,
+        buffer: &mut Buffer,
+        decl_prefix: &str,
+        name: &str,
+        now: f64,
+    ) -> Option<Range<usize>> {
+        let sel = self.selections.primary().range();
+        if sel.is_empty() || self.selections.ranges.len() != 1 {
+            return None;
+        }
+        let rope = buffer.rope();
+        let expr: String = rope.byte_slice(sel.clone()).into();
+        if expr.contains('\n') {
+            return None; // a multi-line expression is not something to guess the shape of
+        }
+        let line_ix = rope.byte_to_line(sel.start);
+        let ls = rope.line_to_byte(line_ix);
+        let indent = leading_ws(rope, ls);
+        let decl = format!("{indent}{decl_prefix}{name} = {expr};\n");
+        // Two edits in ONE transaction so undo restores both together — an extract that half
+        // undoes leaves code that does not compile.
+        let name_at = ls + indent.len() + decl_prefix.len();
+        let name_len = name.len();
+        let before = self.selections.snapshot();
+        let tx = crate::buffer::Transaction {
+            changes: vec![
+                crate::buffer::Change { start: ls, end: ls, text: decl },
+                crate::buffer::Change { start: sel.start, end: sel.end, text: name.to_string() },
+            ],
+        };
+        self.remap_snippet(&tx);
+        let pre = rope.clone();
+        self.folds.remap(&pre, &tx);
+        let after_sel = Selections::single(name_at + name_len);
+        let after = after_sel.snapshot();
+        buffer.record(&tx, EditMeta { kind: EditKind::Other, carets: 1, time: now, before, after });
+        if let Some(syn) = &mut self.syntax {
+            syn.edited(buffer.rope(), &tx.changes);
+        }
+        self.edits_out.push((pre, tx));
+        self.selections = after_sel;
+        Some(name_at..name_at + name_len)
+    }
+
+    /// Ctrl+Shift+Enter: finish the statement the caret is in and put the caret where you would
+    /// type next.
+    ///
+    /// Deliberately conservative — it completes what is unambiguous from the line's own text and
+    /// does nothing otherwise. A "smart" action that guesses wrong is worse than one that
+    /// occasionally declines, because it silently rewrites code you were mid-thought on.
+    ///
+    /// * unbalanced `(` → close it, then apply the rules below to the result
+    /// * `if (…)` / `for (…)` / `while (…)` with nothing after → ` {`, newline, indent, `}`
+    /// * an expression statement missing its `;` → append one
+    /// * already terminated → just move to the next line, indented
+    pub fn complete_statement(&mut self, buffer: &mut Buffer, now: f64) {
+        if !self.lang.is_some_and(Lang::brace_indented) {
+            return;
+        }
+        let rope = buffer.rope();
+        let head = self.selections.primary().head;
+        let line_ix = rope.byte_to_line(head);
+        let ls = rope.line_to_byte(line_ix);
+        let line: String = rope.line(line_ix).into();
+        let line = line.trim_end_matches(['\n', '\r']).to_string();
+        let end = ls + line.len();
+        let indent = leading_ws(rope, ls);
+        let code = code_of_line(&line, self.lang);
+        let trimmed = code.trim_end();
+        // Count on a copy with literal CONTENTS blanked, so `puts("(")` is not read as having an
+        // unclosed paren. Comments are already gone; lengths are preserved, so `trimmed` and the
+        // mask agree position for position.
+        let masked = mask_literals(trimmed, self.lang);
+        let opens = masked.chars().filter(|c| *c == '(').count();
+        let closes = masked.chars().filter(|c| *c == ')').count();
+        let mut tail = String::new();
+        tail.push_str(&")".repeat(opens.saturating_sub(closes)));
+
+        let with_parens = format!("{trimmed}{tail}");
+        let starts_block = ["if", "for", "while", "switch"]
+            .iter()
+            .any(|kw| starts_with_keyword(&with_parens, kw));
+
+        let (insert, caret_back) = if starts_block && with_parens.ends_with(')') {
+            // `if (x)` -> block, caret on the body line.
+            let body = format!("{indent}{TAB}");
+            (format!("{tail} {{\n{body}\n{indent}}}"), indent.len() + 2)
+        } else if with_parens.is_empty() || with_parens.ends_with([';', '{', '}', ':']) {
+            // Nothing to finish — just go to the next line, like Enter would.
+            (format!("{tail}\n{indent}"), 0)
+        } else {
+            (format!("{tail};\n{indent}"), 0)
+        };
+
+        // Insert at END OF LINE regardless of where in the line the caret sits: finishing a
+        // statement is a statement-level action, and requiring the caret at the end would make it
+        // useless mid-edit, which is exactly when it is reached for.
+        let n = insert.len();
+        self.apply_edits_caret(buffer, EditKind::Other, now, move |_, _| {
+            (end..end, insert.clone(), n - caret_back)
+        });
+    }
+
     /// Ctrl+Shift+F7: mark every occurrence of the identifier under the caret in THIS file.
     ///
     /// Whole-word, case-sensitive, and literal — this is the cheap in-file companion to Find
@@ -2212,6 +2323,7 @@ impl EditorView {
             // duplicated.
             Key::Y if m.command => self.delete_lines(buffer, now),
             Key::U if m.command && m.shift => self.toggle_case(buffer, now),
+            Key::Enter if m.command && m.shift => self.complete_statement(buffer, now),
             Key::W if m.command && m.shift => self.shrink_selection(buffer),
             Key::W if m.command => self.expand_selection(buffer),
             Key::G if m.alt && m.shift => self.carets_to_line_ends(buffer),
@@ -4055,6 +4167,63 @@ fn inner_span(rope: &Rope, outer: &Range<usize>) -> Range<usize> {
     s..e
 }
 
+/// The code part of a line with string and character literal CONTENTS blanked to spaces, so
+/// bracket counting cannot be fooled by `puts("(")`. Lengths are preserved, keeping every byte
+/// offset in the masked copy valid against the original.
+fn mask_literals(line: &str, lang: Option<Lang>) -> String {
+    let code = code_of_line(line, lang);
+    let sq_string = lang.is_some_and(|l| l.single_quote_is_string());
+    let mut out = String::with_capacity(code.len());
+    let mut i = 0usize;
+    let mut quote: Option<char> = None;
+    while i < code.len() {
+        let Some(ch) = code[i..].chars().next() else { break };
+        let n = ch.len_utf8();
+        match quote {
+            Some(q) => {
+                if ch == '\\' {
+                    out.push_str(&" ".repeat(n));
+                    i += n;
+                    if let Some(c2) = code[i..].chars().next() {
+                        out.push_str(&" ".repeat(c2.len_utf8()));
+                        i += c2.len_utf8();
+                    }
+                    continue;
+                }
+                // Keep the CLOSING delimiter itself so a half-open literal is still visible.
+                out.push(if ch == q { ch } else { ' ' });
+                if ch == q {
+                    quote = None;
+                }
+            }
+            None => {
+                if ch == '"' || (ch == '\'' && sq_string) {
+                    quote = Some(ch);
+                    out.push(ch);
+                } else if ch == '\'' {
+                    if let Some(len) = char_literal_len(&code[i..]) {
+                        // Blank the whole `'x'` run in one go.
+                        out.push_str(&" ".repeat(len));
+                        i += len;
+                        continue;
+                    }
+                    out.push(ch);
+                } else {
+                    out.push(ch);
+                }
+            }
+        }
+        i += n;
+    }
+    out
+}
+
+/// Does `s` begin with the keyword `kw` as a whole word (`if (` yes, `ifx (` no)?
+fn starts_with_keyword(s: &str, kw: &str) -> bool {
+    let t = s.trim_start();
+    t.strip_prefix(kw).is_some_and(|rest| !rest.starts_with(|c: char| c.is_alphanumeric() || c == '_'))
+}
+
 fn is_word_byte(b: u8) -> bool {
     b.is_ascii_alphanumeric() || b == b'_' || b >= 0x80
 }
@@ -4739,6 +4908,104 @@ mod tests {
     fn sel_text(v: &EditorView, b: &Buffer) -> String {
         let r = v.selections.primary().range();
         b.rope().byte_slice(r).into()
+    }
+
+    #[test]
+    fn extract_variable_declares_above_and_substitutes() {
+        let (mut v, mut b) = setup("void f(void) {\n    g(a + b * 2);\n}\n");
+        let src = b.rope().to_string();
+        let s = src.find("a + b * 2").unwrap();
+        let e = s + "a + b * 2".len();
+        v.selections = Selections { ranges: vec![Selection { anchor: s, head: e, goal_col: None }], primary: 0 };
+        let name_range = v.extract_variable(&mut b, "int ", "tmp", 0.0).unwrap();
+        assert_eq!(b.rope().to_string(), "void f(void) {\n    int tmp = a + b * 2;\n    g(tmp);\n}\n");
+        // The returned span must be the NAME in the new declaration, for an inline rename.
+        assert_eq!(&b.rope().to_string()[name_range], "tmp");
+    }
+
+    #[test]
+    fn extract_variable_undoes_as_one_step() {
+        // Both edits must ride one transaction: a half-undone extract does not compile.
+        let before = "void f(void) {\n    g(x + 1);\n}\n";
+        let (mut v, mut b) = setup(before);
+        let s = before.find("x + 1").unwrap();
+        v.selections = Selections { ranges: vec![Selection { anchor: s, head: s + 5, goal_col: None }], primary: 0 };
+        v.extract_variable(&mut b, "int ", "t", 0.0).unwrap();
+        v.undo(&mut b);
+        assert_eq!(b.rope().to_string(), before);
+    }
+
+    #[test]
+    fn extract_variable_needs_a_single_line_selection() {
+        let (mut v, mut b) = setup("int x = 1;\n");
+        v.selections = Selections::single(4); // no selection
+        assert!(v.extract_variable(&mut b, "int ", "t", 0.0).is_none());
+        // Multi-line: the shape is not safely guessable.
+        let (mut v, mut b) = setup("int x =\n  1;\n");
+        v.selections = Selections { ranges: vec![Selection { anchor: 0, head: 11, goal_col: None }], primary: 0 };
+        assert!(v.extract_variable(&mut b, "int ", "t", 0.0).is_none());
+    }
+
+    fn after_complete(src: &str, caret: usize) -> (String, usize) {
+        let (mut v, mut b) = setup(src);
+        v.selections = Selections::single(caret);
+        v.complete_statement(&mut b, 0.0);
+        (b.rope().to_string(), v.selections.primary().head)
+    }
+
+    #[test]
+    fn complete_statement_adds_the_missing_semicolon() {
+        let (out, _) = after_complete("int x = 1", 9);
+        assert_eq!(out, "int x = 1;\n");
+    }
+
+    #[test]
+    fn complete_statement_closes_open_parens_first() {
+        let (out, _) = after_complete("foo(bar(1", 9);
+        assert_eq!(out, "foo(bar(1));\n");
+    }
+
+    #[test]
+    fn complete_statement_opens_a_block_for_if() {
+        let (out, caret) = after_complete("if (x)", 6);
+        assert_eq!(out, "if (x) {\n    \n}");
+        // The caret must land on the BODY line, ready to type.
+        assert_eq!(&out[..caret], "if (x) {\n    ");
+    }
+
+    #[test]
+    fn complete_statement_closes_the_condition_then_opens_the_block() {
+        let (out, _) = after_complete("if (x == 1", 10);
+        assert_eq!(out, "if (x == 1) {\n    \n}");
+    }
+
+    #[test]
+    fn complete_statement_on_a_finished_line_just_moves_on() {
+        let (out, _) = after_complete("int x = 1;", 4);
+        assert_eq!(out, "int x = 1;\n");
+    }
+
+    #[test]
+    fn complete_statement_works_from_mid_line() {
+        // Reached for precisely when the caret is NOT at the end.
+        let (out, _) = after_complete("int x = 1", 4);
+        assert_eq!(out, "int x = 1;\n");
+    }
+
+    #[test]
+    fn complete_statement_ignores_parens_in_strings() {
+        let (out, _) = after_complete(r#"puts("(")"#, 9);
+        assert_eq!(out, "puts(\"(\");\n", "a paren inside a string is not unbalanced");
+    }
+
+    #[test]
+    fn complete_statement_does_nothing_in_python() {
+        let buffer = Buffer::from_text("x = 1");
+        let mut v = EditorView::new(&buffer, "t.py");
+        let mut b = buffer;
+        v.selections = Selections::single(5);
+        v.complete_statement(&mut b, 0.0);
+        assert_eq!(b.rope().to_string(), "x = 1", "no semicolons in Python");
     }
 
     #[test]

@@ -3564,6 +3564,8 @@ impl App {
                 self.bottom_open = true;
             }
             C::SwitchHeaderSource => self.switch_header_source(),
+            C::CompleteStatement => self.editor_command(ctx, |v, b, n| v.complete_statement(b, n)),
+            C::ExtractVariable => self.extract_variable(ctx),
             C::HighlightUsagesInFile => {
                 let g = &mut self.groups[self.focused];
                 let a = g.active;
@@ -6413,6 +6415,38 @@ impl App {
     }
 
     /// Ctrl+G: open the go-to-line prompt as the only overlay.
+    /// Ctrl+Alt+V. The declaration keyword comes from the language, and the new name goes
+    /// straight into the rename prompt — the placeholder is never what you want to keep.
+    fn extract_variable(&mut self, ctx: &egui::Context) {
+        let now = ctx.input(|i| i.time);
+        let g = &mut self.groups[self.focused];
+        let active = g.active;
+        let Some(f) = g.files.get_mut(active).filter(|f| f.loaded) else { return };
+        // C has no inference, so `int` is a guess the user must correct — but it is the common
+        // case and leaving the type blank would not compile at all. Rust and the script languages
+        // infer, so their keyword is complete on its own.
+        let prefix = match f.lang {
+            Some(Lang::Rust) => "let ",
+            Some(Lang::Js) | Some(Lang::Ts) | Some(Lang::Tsx) => "const ",
+            Some(Lang::Python) => "",
+            Some(Lang::C) | Some(Lang::Cpp) => "int ",
+            _ => "",
+        };
+        match f.view.extract_variable(&mut f.buffer, prefix, "extracted", now) {
+            Some(_) => {
+                self.lsp_message = Some("extracted — Shift+F6 to rename it".into());
+                if prefix == "int " {
+                    self.lsp_message =
+                        Some("extracted as `int` — fix the type, Shift+F6 to rename".into());
+                }
+            }
+            None => {
+                self.lsp_message =
+                    Some("select a single-line expression to extract".into())
+            }
+        }
+    }
+
     /// Alt+F1: show (and select) the active file in the project tree, opening its folders.
     fn reveal_active_file(&mut self) {
         let Some(path) = self.groups[self.focused]
@@ -7475,6 +7509,9 @@ impl eframe::App for App {
         if ctx.input(|i| i.modifiers.command && i.modifiers.shift && i.key_pressed(egui::Key::Backspace))
         {
             self.run_command(palette::Command::LastEditLocation, ctx);
+        }
+        if ctx.input(|i| i.modifiers.command && i.modifiers.alt && i.key_pressed(egui::Key::V)) {
+            self.extract_variable(ctx);
         }
         if ctx.input(|i| i.modifiers.command && i.modifiers.shift && i.key_pressed(egui::Key::F7)) {
             self.run_command(palette::Command::HighlightUsagesInFile, ctx);
@@ -8856,6 +8893,7 @@ impl eframe::App for App {
         }
         if let Some((pos, path, actions)) = self.fix_menu.clone() {
             let mut close_menu = false;
+            let mut extract_var = false;
             egui::Area::new("quickfixes".into())
                 .fixed_pos(pos)
                 .order(egui::Order::Foreground)
@@ -8875,6 +8913,19 @@ impl eframe::App for App {
                                 .clicked_by(egui::PointerButton::Primary)
                             {
                                 self.start_rename();
+                                close_menu = true;
+                            }
+                            // Extract Variable is ours too — purely textual, so it works with no
+                            // language server at all, which is when it is most wanted.
+                            if ui
+                                .selectable_label(
+                                    false,
+                                    egui::RichText::new("Extract Variable…      Ctrl+Alt+V")
+                                        .size(12.5),
+                                )
+                                .clicked_by(egui::PointerButton::Primary)
+                            {
+                                extract_var = true;
                                 close_menu = true;
                             }
                             // Change Signature is ours (PSI-driven) — no C language server
@@ -8925,6 +8976,9 @@ impl eframe::App for App {
                         }
                     });
                 });
+            if extract_var {
+                self.extract_variable(ctx);
+            }
             if close_menu || ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
                 self.fix_menu = None;
             }
