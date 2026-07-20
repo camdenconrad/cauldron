@@ -110,7 +110,7 @@ pub const COMMANDS: &[(Command, &str, &str)] = &[
     (Command::Run, "Run", "Shift+F10"),
     (Command::RunCurrentFile, "Run Current File", "Ctrl+Shift+F10"),
     (Command::Build, "Build", "Ctrl+F9"),
-    (Command::StopRun, "Stop", ""),
+    (Command::StopRun, "Stop", "Ctrl+F2"),
     (Command::InstallDependencies, "Install Dependencies", ""),
     (Command::ToggleTerminal, "Toggle Terminal", "Alt+F12"),
     (Command::ToggleProjectPanel, "Toggle Project Panel", "Alt+1"),

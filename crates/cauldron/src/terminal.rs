@@ -35,6 +35,17 @@ pub struct TerminalPane {
     spawn_error: Option<String>,
     /// Grab egui focus for the active grid on the next frame (just opened / restarted).
     focus_pending: bool,
+    /// The Run button's PTY. Deliberately NOT a member of `terms`: a program you launched is
+    /// output, not a shell you opened, and it belongs under Output where the user goes looking
+    /// for it. It keeps a real PTY (colors, progress bars, interactive stdin) — that is the
+    /// whole reason Run never used the piped [`crate::runner::Runner`].
+    run: Option<Term>,
+    /// Focus the run grid on its next render (just launched).
+    run_focus_pending: bool,
+    /// Did the run grid hold egui focus last frame? Cleared every frame by `pump_all` and
+    /// re-established only by an actual `run_ui` render, so a hidden Output pane can never leave
+    /// a stale "the program owns the keyboard".
+    run_has_focus: bool,
     /// Did the active grid hold egui focus on the last frame it rendered? Read via
     /// [`TerminalPane::shell_focused`] by the global key handling, which must keep its hands off
     /// keys the shell owns. Stale by at most one frame, which focus changes tolerate.
@@ -56,6 +67,9 @@ impl TerminalPane {
             spawn_error: None,
             focus_pending: false,
             has_focus: false,
+            run: None,
+            run_focus_pending: false,
+            run_has_focus: false,
         }
     }
 
@@ -76,6 +90,7 @@ impl TerminalPane {
         let had_shells = !self.terms.is_empty();
         self.root = root.to_path_buf();
         self.terms.clear(); // drop = SIGHUP to every shell of the old project
+        self.run = None; // and the old project's program, for the same reason
         self.active = 0;
         self.next_label = 0;
         self.spawn_error = None;
@@ -104,23 +119,56 @@ impl TerminalPane {
         }
     }
 
-    /// Run one command line in a fresh PTY tab labeled "run" — real terminal semantics for the
-    /// Run button: colors, progress bars, interactive stdin. Any previous run tab is dropped
-    /// first (SIGHUP ends its foreground child). The command is written into a fresh shell's
-    /// stdin; the PTY buffers it until the shell is ready.
+    /// Run one command line in a fresh PTY owned by the Output pane — real terminal semantics for
+    /// the Run button: colors, progress bars, interactive stdin. Any previous run is dropped first
+    /// (SIGHUP ends its foreground child). The command is written into a fresh shell's stdin; the
+    /// PTY buffers it until the shell is ready.
+    ///
+    /// This does NOT open the terminal pane: the output surfaces under Output, rendered by
+    /// [`TerminalPane::run_ui`]. The caller is responsible for showing that tab.
     pub fn run_command(&mut self, cmdline: &str, cwd: &Path, ctx: &egui::Context) {
         self.stop_run_tab();
-        self.open = true;
         match Session::spawn(80, 24, self.cfg.scrollback, ctx, Some(cwd.to_path_buf())) {
             Ok(mut s) => {
                 s.write(format!("{cmdline}\n").as_bytes());
-                self.terms.push(Term { session: s, label: "run".into() });
-                self.active = self.terms.len() - 1;
+                self.run = Some(Term { session: s, label: cmdline.to_string() });
                 self.spawn_error = None;
-                self.focus_pending = true;
+                self.run_focus_pending = true;
             }
             Err(e) => self.spawn_error = Some(format!("{e:#}")),
         }
+    }
+
+    /// Is a launched program still alive? Drives the Run/Stop button swap. A run whose shell has
+    /// exited stays VISIBLE (you want to read what it printed) but is no longer "running".
+    pub fn run_running(&self) -> bool {
+        self.run.as_ref().is_some_and(|t| !t.session.exited())
+    }
+
+    /// Is there a run session at all — live or finished — for Output to show?
+    pub fn has_run(&self) -> bool {
+        self.run.is_some()
+    }
+
+    /// Render the run PTY into the Output pane. Returns true if it drew a grid; false when there
+    /// is no run, so Output can fall back to the piped build log.
+    pub fn run_ui(&mut self, ui: &mut egui::Ui) -> bool {
+        let Some(t) = self.run.as_mut() else { return false };
+        let resp = cider::widget::terminal_ui(
+            ui,
+            &mut t.session,
+            &self.cfg,
+            &mut self.emoji,
+            &mut self.dragging_sel,
+        );
+        if self.run_focus_pending {
+            resp.request_focus();
+            self.run_focus_pending = false;
+        }
+        // The run grid takes the keyboard on the same terms as a shell — a program reading stdin
+        // must get the keystrokes, and the global handling has to keep its hands off them.
+        self.run_has_focus = resp.has_focus();
+        true
     }
 
     /// Kill the "run" tab if one exists (dropping the session SIGHUPs the shell and its child).
@@ -134,19 +182,17 @@ impl TerminalPane {
         for t in &mut self.terms {
             t.session.pump(ctx);
         }
+        if let Some(t) = self.run.as_mut() {
+            t.session.pump(ctx);
+        }
+        // Re-established below only by a real run_ui render (see the field docs).
+        self.run_has_focus = false;
     }
 
+    /// Kill the running program (dropping the session SIGHUPs the shell and its child) and clear
+    /// the pane. Safe to call when nothing is running.
     pub fn stop_run_tab(&mut self) {
-        if let Some(i) = self.terms.iter().position(|t| t.label == "run") {
-            self.terms.remove(i);
-            // Identity remap (see the reap in ui_embedded): a run tab left of the active
-            // shell must not shift which shell the keyboard talks to.
-            if i < self.active {
-                self.active -= 1;
-            } else if self.active >= self.terms.len() {
-                self.active = self.terms.len().saturating_sub(1);
-            }
-        }
+        self.run = None;
     }
 
     fn spawn_tab(&mut self, ctx: &egui::Context) {
@@ -167,7 +213,7 @@ impl TerminalPane {
     /// claiming any key the shell wants (Tab, Ctrl+Tab): while you're typing in the terminal, the
     /// terminal gets the keystroke. False whenever the pane is closed or shows no grid at all.
     pub fn shell_focused(&self) -> bool {
-        self.open && self.has_focus
+        (self.open && self.has_focus) || self.run_has_focus
     }
 
     pub fn ui_embedded(&mut self, ui: &mut egui::Ui, root: &Path) {

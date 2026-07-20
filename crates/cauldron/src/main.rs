@@ -1835,6 +1835,14 @@ impl App {
         depsinstall::install(root, force, generation, status, move || repaint());
     }
 
+    /// Stop whatever is running, from either engine — the piped build ([`runner::Runner`]) or the
+    /// Run button's PTY. Both are killed unconditionally: the user pressed Stop, and asking which
+    /// of the two they meant would be theatre.
+    fn stop_run(&mut self) {
+        self.runner.stop();
+        self.terminal.stop_run_tab();
+    }
+
     fn run_project(&mut self, ctx: &egui::Context, run: bool) {
         // Save every dirty buffer first. Building/running the on-disk copy while the editor shows
         // unsaved edits runs code that isn't what you're looking at — the classic "why didn't my
@@ -1846,8 +1854,11 @@ impl App {
         let root = self.workspace.root.clone();
         // A selected run configuration wins for RUN (build keeps the project default).
         if run {
-            // RUN executes in a real PTY (terminal tab "run"): colors, progress bars, and
-            // interactive stdin all work — piped output gave programs a dumb non-tty.
+            // RUN executes in a real PTY rendered by the Output pane: colors, progress bars, and
+            // interactive stdin all work — piped output gave programs a dumb non-tty — while the
+            // program's output stays where you look for output, not in a shell tab you didn't open.
+            self.bottom_open = true;
+            self.bottom_tab = BottomTab::Output;
             if let Some(cfg) = self.run_cfgs.selected().cloned() {
                 let (prog, args, cwd) = runconfig::command_line(&cfg, &root);
                 let mut line = String::new();
@@ -3476,10 +3487,7 @@ impl App {
             C::Run => self.run_project(ctx, true),
             C::RunCurrentFile => self.run_current_file(ctx),
             C::Build => self.run_project(ctx, false),
-            C::StopRun => {
-                self.runner.stop();
-                self.terminal.stop_run_tab();
-            }
+            C::StopRun => self.stop_run(),
             C::InstallDependencies => {
                 self.install_deps(true);
                 self.bottom_open = true;
@@ -4129,8 +4137,17 @@ impl App {
                         self.run_project(ctx, false);
                         ui.close_menu();
                     }
-                    if self.runner.running && ui.button("■ Stop").clicked_by(egui::PointerButton::Primary) {
-                        self.runner.stop();
+                    let running = self.runner.running || self.terminal.run_running();
+                    if ui
+                        .add_enabled(
+                            running,
+                            egui::Button::new(
+                                egui::RichText::new("■ Stop    Ctrl+F2").color(colors::ERROR()),
+                            ),
+                        )
+                        .clicked_by(egui::PointerButton::Primary)
+                    {
+                        self.stop_run();
                         ui.close_menu();
                     }
                     ui.separator();
@@ -4298,18 +4315,26 @@ impl App {
                 });
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     ui.spacing_mut().item_spacing.x = 2.0;
-                    if self.runner.running {
-                        if ui.button("■").on_hover_text("Stop").clicked_by(egui::PointerButton::Primary) {
-                            self.runner.stop();
-                        }
-                        ui.spinner();
-                    } else {
-                        {
+                    // The run-config selector stays put whether or not something is running — it
+                    // is what you ran, and having it vanish mid-run made the toolbar jump.
+                    {
                         let root = self.workspace.root.clone();
                         if self.run_cfgs.selector_ui(ui, &root) {
                             self.run_cfgs.save(&root);
                         }
                     }
+                    let running = self.runner.running || self.terminal.run_running();
+                    if running {
+                        // Red ■ replaces ▶ in place: one button, one meaning at a time.
+                        if ui
+                            .button(egui::RichText::new("■").color(colors::ERROR()).size(15.0))
+                            .on_hover_text("Stop (Ctrl+F2)")
+                            .clicked_by(egui::PointerButton::Primary)
+                        {
+                            self.stop_run();
+                        }
+                        ui.spinner();
+                    } else {
                     if icons::tool_icon_button(ui, icons::ToolIcon::Run, true, "Run (Shift+F10)")
                             .clicked_by(egui::PointerButton::Primary)
                         {
@@ -4604,7 +4629,11 @@ impl App {
         style::hairline(ui);
         match self.bottom_tab {
             BottomTab::Output => {
-                self.runner.ui_embedded(ui);
+                // A launched program's PTY wins the pane; the piped build log is the fallback.
+                // (Stop clears the run, which hands Output back to the last build's output.)
+                if !self.terminal.run_ui(ui) {
+                    self.runner.ui_embedded(ui);
+                }
                 (None, None)
             }
             BottomTab::Problems => self.problems_ui(ui),
@@ -7213,6 +7242,10 @@ impl eframe::App for App {
         }
         if cmd(egui::Key::F9) {
             self.run_project(ctx, false);
+        }
+        // Ctrl+F2 = stop, JetBrains' binding. Harmless when nothing is running.
+        if cmd(egui::Key::F2) {
+            self.stop_run();
         }
         // Editor zoom (Ctrl+± / Ctrl+0) — EDITOR-ONLY; the whole-UI zoom lives in Settings.
         let mut font_delta = 0.0f32;
