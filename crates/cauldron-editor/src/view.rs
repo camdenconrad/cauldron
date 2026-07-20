@@ -2217,6 +2217,8 @@ impl EditorView {
                 buffer.seal();
             }
             // --- line-structural edits (checked before the plain motion arrow arms) -----------
+            Key::ArrowUp if m.command && m.shift => self.move_statement(buffer, false, now),
+            Key::ArrowDown if m.command && m.shift => self.move_statement(buffer, true, now),
             Key::ArrowUp if m.alt && m.shift => self.move_lines(buffer, false, now),
             Key::ArrowDown if m.alt && m.shift => self.move_lines(buffer, true, now),
             // Ghost completion: Tab accepts, Esc dismisses (before popup routing — an offered
@@ -2974,6 +2976,73 @@ impl EditorView {
     /// Alt+Shift+Up / Alt+Shift+Down — move the block of lines spanned by the selection up or down
     /// past its neighbor, carrying the selection with it (JetBrains/VS Code). A no-op at the top
     /// (moving up) or bottom (moving down) edge.
+    /// Ctrl+Shift+Up/Down: move the whole STATEMENT the caret is in, over its neighbour.
+    ///
+    /// Distinct from move-line ([`Self::move_lines`], Alt+Shift+Up/Down), which shifts one
+    /// physical line and happily rips a `}` off its block or drags a line out of an `if` body.
+    /// This moves the syntax node — a whole `if`, a whole loop, a whole declaration — and swaps it
+    /// with the sibling statement on the other side, so the code stays valid at every step.
+    ///
+    /// Falls back to a line move when there is no parse tree: doing nothing would make the
+    /// keystroke feel broken in a file the editor simply cannot parse.
+    pub fn move_statement(&mut self, buffer: &mut Buffer, down: bool, now: f64) {
+        let rope = buffer.rope().clone();
+        let Some(syn) = &self.syntax else {
+            return self.move_lines(buffer, down, now);
+        };
+        let caret = self.selections.primary().head;
+        // The outermost node that still starts on the caret's own line: for a multi-line `if`
+        // this is the whole statement, not the condition the caret happens to sit in.
+        let line = rope.byte_to_line(caret);
+        let line_start = rope.line_to_byte(line);
+        let mut node = syn.tree.root_node().named_descendant_for_byte_range(caret, caret);
+        let mut stmt = None;
+        while let Some(n) = node {
+            if n.start_byte() >= line_start && n.parent().is_some() {
+                stmt = Some(n);
+            }
+            node = n.parent();
+        }
+        let Some(stmt) = stmt else { return self.move_lines(buffer, down, now) };
+        // The sibling to swap with, skipping nothing: comments and attributes are named siblings
+        // and moving past them silently would reorder code and its comment independently.
+        let sibling = match down {
+            true => stmt.next_named_sibling(),
+            false => stmt.prev_named_sibling(),
+        };
+        let Some(sib) = sibling else {
+            // No sibling that way — at the top or bottom of its block. A line move here would
+            // push the statement out of its block, so decline instead.
+            return;
+        };
+        let (a, b) = match down {
+            true => (stmt, sib),
+            false => (sib, stmt),
+        };
+        // Swap whole LINES spanning each node, so indentation and trailing comments travel with
+        // them and the result never lands mid-line.
+        let a_start = rope.line_to_byte(rope.byte_to_line(a.start_byte()));
+        let a_end = line_content_end_at(&rope, a.end_byte());
+        let b_start = rope.line_to_byte(rope.byte_to_line(b.start_byte()));
+        let b_end = line_content_end_at(&rope, b.end_byte());
+        if a_end > b_start {
+            return; // overlapping spans (a node sharing a line with its sibling) — not safe
+        }
+        let a_text: String = rope.byte_slice(a_start..a_end).into();
+        let mid: String = rope.byte_slice(a_end..b_start).into();
+        let b_text: String = rope.byte_slice(b_start..b_end).into();
+        let combined = format!("{b_text}{mid}{a_text}");
+        // Keep the caret on the statement the user moved, at the same offset within it.
+        let within = caret.saturating_sub(if down { a_start } else { b_start });
+        let new_caret = match down {
+            true => a_start + b_text.len() + mid.len() + within,
+            false => a_start + within,
+        };
+        self.apply_edits_caret(buffer, EditKind::Other, now, move |_, _| {
+            (a_start..b_end, combined.clone(), new_caret - a_start)
+        });
+    }
+
     pub fn move_lines(&mut self, buffer: &mut Buffer, down: bool, now: f64) {
         let rope = buffer.rope().clone();
         let lines = self.spanned_lines(&rope);
@@ -4222,6 +4291,15 @@ fn starts_with_keyword(s: &str, kw: &str) -> bool {
     t.strip_prefix(kw).is_some_and(|rest| !rest.starts_with(|c: char| c.is_alphanumeric() || c == '_'))
 }
 
+/// Byte offset of the end of the line CONTAINING `byte`, excluding the newline itself.
+/// (Distinct from `line_end_byte`, which takes a line index and includes the break.)
+fn line_content_end_at(rope: &Rope, byte: usize) -> usize {
+    let line = rope.byte_to_line(byte.min(rope.len_bytes()));
+    let start = rope.line_to_byte(line);
+    let text: String = rope.line(line).into();
+    start + text.trim_end_matches(['\n', '\r']).len()
+}
+
 fn is_word_byte(b: u8) -> bool {
     b.is_ascii_alphanumeric() || b == b'_' || b >= 0x80
 }
@@ -4906,6 +4984,43 @@ mod tests {
     fn sel_text(v: &EditorView, b: &Buffer) -> String {
         let r = v.selections.primary().range();
         b.rope().byte_slice(r).into()
+    }
+
+    #[test]
+    fn move_statement_swaps_whole_multiline_statements() {
+        // The case move-LINE gets wrong: it would rip the `}` off the if-block.
+        let src = "void f(void)\n{\n    if (a) {\n        one();\n    }\n    two();\n}\n";
+        let (mut v, mut b) = setup(src);
+        let at = src.find("if (a)").unwrap();
+        v.selections = Selections::single(at + 2);
+        v.move_statement(&mut b, true, 0.0);
+        assert_eq!(
+            b.rope().to_string(),
+            "void f(void)\n{\n    two();\n    if (a) {\n        one();\n    }\n}\n"
+        );
+    }
+
+    #[test]
+    fn move_statement_back_up_restores_the_original() {
+        let src = "void f(void)\n{\n    one();\n    two();\n}\n";
+        let (mut v, mut b) = setup(src);
+        let at = src.find("one();").unwrap();
+        v.selections = Selections::single(at);
+        v.move_statement(&mut b, true, 0.0);
+        assert_eq!(b.rope().to_string(), "void f(void)\n{\n    two();\n    one();\n}\n");
+        v.move_statement(&mut b, false, 1.0);
+        assert_eq!(b.rope().to_string(), src, "down then up is a round trip");
+    }
+
+    #[test]
+    fn move_statement_declines_at_the_end_of_its_block() {
+        // A line move here would push the statement out through the closing brace.
+        let src = "void f(void)\n{\n    only();\n}\n";
+        let (mut v, mut b) = setup(src);
+        let at = src.find("only();").unwrap();
+        v.selections = Selections::single(at);
+        v.move_statement(&mut b, true, 0.0);
+        assert_eq!(b.rope().to_string(), src, "no sibling below — must not escape the block");
     }
 
     #[test]

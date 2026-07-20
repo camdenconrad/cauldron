@@ -796,6 +796,8 @@ struct App {
     last_edit: Option<(PathBuf, usize)>,
     /// Shift+F6 rename overlay: (new-name buffer, path, byte, generation).
     rename: Option<(String, PathBuf, usize, u64)>,
+    /// Language of the file being renamed, for keyword and identifier validation.
+    rename_lang: Option<Lang>,
     /// Find-usages results for the dock tab: (display rel, path, line, preview).
     usages: Vec<(PathBuf, usize, String)>,
     usages_gen: Option<u64>,
@@ -1080,6 +1082,7 @@ impl App {
             peek_pending: false,
             last_edit: None,
             rename: None,
+            rename_lang: None,
             usages: Vec::new(),
             usages_gen: None,
             call_hierarchy_gen: None,
@@ -3715,6 +3718,8 @@ impl App {
             C::ExtractFunction => self.extract_function(ctx),
             C::CreateFunctionFromUsage => self.create_function_from_usage(ctx),
             C::GenerateDefinition => self.generate_definition(ctx),
+            C::MoveStatementUp => self.editor_command(ctx, |v, b, n| v.move_statement(b, false, n)),
+            C::MoveStatementDown => self.editor_command(ctx, |v, b, n| v.move_statement(b, true, n)),
             C::QuickDefinition => self.quick_definition(ctx),
             C::NextProblem => self.goto_next_problem(true),
             C::PrevProblem => self.goto_next_problem(false),
@@ -6973,7 +6978,9 @@ impl App {
             let (path, gen, byte) = (f.path.clone(), f.buffer.generation, f.view.caret_byte());
             let rope = f.buffer.rope().clone();
             let seed = ident_at(&rope, byte);
+            let lang = f.lang;
             self.close_overlays();
+            self.rename_lang = lang;
             self.rename = Some((seed, path, byte, gen));
             self.prompt_focus_pending = true;
         }
@@ -9627,15 +9634,53 @@ impl eframe::App for App {
             // One-shot focus grab on the open frame only (see prompt_focus_pending).
             let grab_focus = std::mem::take(&mut self.prompt_focus_pending);
             let mut keep = true;
+            let mut commit = false;
+            // What is being renamed, and where its occurrences are in THIS file. The marks are
+            // painted live so the scope of the change is visible before committing to it — a
+            // rename you cannot see the extent of is a rename you have to undo to understand.
+            let (old_name, occurrences) = match self
+                .groups
+                .iter()
+                .flat_map(|g| g.files.iter())
+                .find(|f| f.path == path && f.loaded)
+            {
+                Some(f) => {
+                    let rope = f.buffer.rope();
+                    let name = ident_at(rope, byte);
+                    let n = count_whole_word(&rope.to_string(), &name);
+                    (name, n)
+                }
+                None => (String::new(), 0),
+            };
+            let problem = rename_problem(&buf, &old_name, self.rename_lang, &{
+                match self
+                    .groups
+                    .iter()
+                    .flat_map(|g| g.files.iter())
+                    .find(|f| f.path == path && f.loaded)
+                {
+                    Some(f) => f.buffer.rope().to_string(),
+                    None => String::new(),
+                }
+            });
+            // Anchor at the CARET, like JetBrains: a dialog at the top of the screen makes you
+            // look away from the thing you are renaming.
+            let anchor = self
+                .groups
+                .get_mut(self.focused)
+                .and_then(|g| g.active_file())
+                .and_then(|f| f.view.caret_screen_pos())
+                .map(|p| egui::pos2(p.x, p.y + 20.0))
+                .unwrap_or(egui::pos2(300.0, 160.0));
             egui::Area::new("rename".into())
-                .anchor(egui::Align2::CENTER_TOP, [0.0, 120.0])
+                .fixed_pos(anchor)
                 .order(egui::Order::Foreground)
                 .show(ctx, |ui| {
                     egui::Frame::popup(ui.style())
                         .inner_margin(egui::Margin::same(style::sizes::OVERLAY_PAD))
                         .show(ui, |ui| {
-                            ui.set_width(320.0);
-                            style::panel_header_inline(ui, "Rename Symbol");
+                            ui.set_width(340.0);
+                            style::panel_header_inline(ui, "Rename");
                             let resp = ui.add(
                                 egui::TextEdit::singleline(&mut buf)
                                     .desired_width(f32::INFINITY)
@@ -9644,26 +9689,69 @@ impl eframe::App for App {
                             if grab_focus {
                                 resp.request_focus();
                             }
+                            ui.horizontal(|ui| {
+                                ui.label(
+                                    egui::RichText::new(match occurrences {
+                                        1 => "1 occurrence in this file".to_string(),
+                                        n => format!("{n} occurrences in this file"),
+                                    })
+                                    .size(11.0)
+                                    .color(style::colors::TEXT_MUTED()),
+                                );
+                            });
+                            match &problem {
+                                Some(RenameProblem::Fatal(msg)) => {
+                                    ui.label(
+                                        egui::RichText::new(msg)
+                                            .size(11.5)
+                                            .color(style::colors::ERROR()),
+                                    );
+                                }
+                                Some(RenameProblem::Warn(msg)) => {
+                                    ui.label(
+                                        egui::RichText::new(msg)
+                                            .size(11.5)
+                                            .color(egui::Color32::from_rgb(230, 180, 60)),
+                                    );
+                                }
+                                None => {}
+                            }
                             if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
                                 keep = false;
                             }
+                            // A FATAL problem blocks Enter outright — an invalid identifier or a
+                            // keyword produces code that does not compile, and the server would
+                            // either refuse or, worse, do it.
                             if ui.input(|i| i.key_pressed(egui::Key::Enter))
                                 && !buf.trim().is_empty()
+                                && !matches!(problem, Some(RenameProblem::Fatal(_)))
                             {
                                 keep = false;
-                                if let Some(f) = self
-                                    .groups
-                                    .iter()
-                                    .flat_map(|g| g.files.iter())
-                                    .find(|f| f.path == path && f.loaded)
-                                {
-                                    let rope = f.buffer.rope().clone();
-                                    self.lsp.request_rename(&path, &rope, byte, buf.trim(), gen);
-                                    self.lsp_message = Some("renaming…".into());
-                                }
+                                commit = true;
                             }
                         });
                 });
+            // Paint the occurrences while the prompt is up, and clear them when it closes.
+            if let Some(f) = self.groups.get_mut(self.focused).and_then(|g| g.active_file()) {
+                if keep && !old_name.is_empty() {
+                    let b = &f.buffer;
+                    f.view.highlight_usages(b);
+                } else {
+                    f.view.clear_usage_marks();
+                }
+            }
+            if commit {
+                if let Some(f) = self
+                    .groups
+                    .iter()
+                    .flat_map(|g| g.files.iter())
+                    .find(|f| f.path == path && f.loaded)
+                {
+                    let rope = f.buffer.rope().clone();
+                    self.lsp.request_rename(&path, &rope, byte, buf.trim(), gen);
+                    self.lsp_message = Some("renaming…".into());
+                }
+            }
             if keep {
                 self.rename = Some((buf, path, byte, gen));
             }
@@ -11329,6 +11417,92 @@ fn counterpart_path(path: &Path) -> Option<PathBuf> {
     None
 }
 
+/// Why a proposed rename is questionable. Fatal blocks the commit; Warn does not — plenty of
+/// legitimate renames shadow something, and the language server (or the compiler) is the real
+/// authority. Refusing them outright would be more annoying than useful.
+enum RenameProblem {
+    Fatal(String),
+    Warn(String),
+}
+
+/// Reserved words that must never become an identifier. Not exhaustive per language on purpose —
+/// this catches the ones people actually type by accident; the compiler catches the rest.
+const KEYWORDS_C: &[&str] = &[
+    "auto", "break", "case", "char", "const", "continue", "default", "do", "double", "else",
+    "enum", "extern", "float", "for", "goto", "if", "inline", "int", "long", "register",
+    "restrict", "return", "short", "signed", "sizeof", "static", "struct", "switch", "typedef",
+    "union", "unsigned", "void", "volatile", "while",
+];
+const KEYWORDS_RUST: &[&str] = &[
+    "as", "break", "const", "continue", "crate", "dyn", "else", "enum", "extern", "false", "fn",
+    "for", "if", "impl", "in", "let", "loop", "match", "mod", "move", "mut", "pub", "ref",
+    "return", "self", "static", "struct", "super", "trait", "true", "type", "unsafe", "use",
+    "where", "while", "async", "await",
+];
+
+/// Validate a proposed new name against the language and the file it lives in.
+fn rename_problem(
+    new: &str,
+    old: &str,
+    lang: Option<Lang>,
+    file_text: &str,
+) -> Option<RenameProblem> {
+    let n = new.trim();
+    if n.is_empty() {
+        return Some(RenameProblem::Fatal("a name is required".into()));
+    }
+    if n == old {
+        return Some(RenameProblem::Warn("unchanged".into()));
+    }
+    // Identifier shape. A name the language cannot spell produces code that does not compile,
+    // and some servers will happily perform the rename anyway.
+    let mut chars = n.chars();
+    let first_ok = chars.next().is_some_and(|c| c.is_alphabetic() || c == '_');
+    let rest_ok = chars.all(|c| c.is_alphanumeric() || c == '_');
+    if !first_ok || !rest_ok {
+        return Some(RenameProblem::Fatal("not a valid identifier".into()));
+    }
+    let keywords = match lang {
+        Some(Lang::Rust) => KEYWORDS_RUST,
+        Some(Lang::C) | Some(Lang::Cpp) => KEYWORDS_C,
+        _ => &[],
+    };
+    if keywords.contains(&n) {
+        return Some(RenameProblem::Fatal(format!("`{n}` is a keyword")));
+    }
+    // Already present in this file: not necessarily a conflict (different scopes, a field vs a
+    // local), so a warning rather than a refusal — but worth seeing BEFORE committing, because
+    // the resulting collision is tedious to unpick afterwards.
+    let existing = count_whole_word(file_text, n);
+    if existing > 0 {
+        return Some(RenameProblem::Warn(format!(
+            "`{n}` already appears {existing}× in this file"
+        )));
+    }
+    None
+}
+
+/// Whole-word occurrences of `needle` in `hay`. Same rule as the usage marks: `count` must not
+/// match inside `counter`.
+fn count_whole_word(hay: &str, needle: &str) -> usize {
+    if needle.is_empty() {
+        return 0;
+    }
+    let b = hay.as_bytes();
+    let is_word = |c: u8| c.is_ascii_alphanumeric() || c == b'_' || c >= 0x80;
+    let mut n = 0usize;
+    let mut at = 0usize;
+    while let Some(off) = hay[at..].find(needle) {
+        let s = at + off;
+        let e = s + needle.len();
+        if (s == 0 || !is_word(b[s - 1])) && (e >= b.len() || !is_word(b[e])) {
+            n += 1;
+        }
+        at = e.max(s + 1);
+    }
+    n
+}
+
 /// Stable content hash for conflict bookkeeping. Only equality matters, never persistence, so
 /// the standard hasher is fine.
 fn hash_str(s: &str) -> u64 {
@@ -11490,6 +11664,57 @@ mod hover_and_fix_tests {
         ));
         std::fs::create_dir_all(&d).unwrap();
         d
+    }
+
+    #[test]
+    fn rename_rejects_names_the_language_cannot_spell() {
+        let f = "int x;";
+        assert!(matches!(
+            rename_problem("2bad", "x", Some(Lang::C), f),
+            Some(RenameProblem::Fatal(_))
+        ));
+        assert!(matches!(
+            rename_problem("has space", "x", Some(Lang::C), f),
+            Some(RenameProblem::Fatal(_))
+        ));
+        assert!(matches!(
+            rename_problem("", "x", Some(Lang::C), f),
+            Some(RenameProblem::Fatal(_))
+        ));
+    }
+
+    #[test]
+    fn rename_rejects_keywords_per_language() {
+        // `struct` is fatal in C; in Python it is an ordinary name.
+        assert!(matches!(
+            rename_problem("struct", "x", Some(Lang::C), "int x;"),
+            Some(RenameProblem::Fatal(_))
+        ));
+        assert!(matches!(
+            rename_problem("impl", "x", Some(Lang::Rust), "let x = 1;"),
+            Some(RenameProblem::Fatal(_))
+        ));
+        assert!(rename_problem("struct", "x", Some(Lang::Python), "x = 1").is_none());
+    }
+
+    #[test]
+    fn rename_warns_but_does_not_block_on_an_existing_name() {
+        // Different scopes make this legitimate often enough that refusing would be worse than
+        // showing it — but it must be visible BEFORE committing.
+        let f = "int total; int count;";
+        assert!(matches!(
+            rename_problem("total", "count", Some(Lang::C), f),
+            Some(RenameProblem::Warn(_))
+        ));
+        assert!(rename_problem("fresh_name", "count", Some(Lang::C), f).is_none());
+    }
+
+    #[test]
+    fn count_whole_word_does_not_match_inside_longer_words() {
+        assert_eq!(count_whole_word("count counter recount count", "count"), 2);
+        assert_eq!(count_whole_word("a_b ab", "ab"), 1);
+        assert_eq!(count_whole_word("", "x"), 0);
+        assert_eq!(count_whole_word("xxx", ""), 0, "an empty needle matches nothing");
     }
 
     #[test]
