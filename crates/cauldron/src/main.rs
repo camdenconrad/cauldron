@@ -755,6 +755,9 @@ struct App {
     fix_menu: Option<(egui::Pos2, PathBuf, Vec<lsp_types::CodeActionOrCommand>)>,
     /// Heading for `fix_menu` — the same popup serves Quick Fixes and Refactor This.
     fix_menu_title: &'static str,
+    /// Cached [`App::create_fn_available`] for the open fix menu (see its docs — it parses the
+    /// whole buffer, and the menu repaints every frame).
+    fix_menu_create_fn: bool,
     /// The Change Signature dialog (Ctrl+F6), when open.
     chsig: Option<chsig_ui::ChangeSigUi>,
     /// Generation of the in-flight rust-analyzer references request backing the dialog. Kept
@@ -1044,6 +1047,7 @@ impl App {
             fix_request_gen: None,
             fix_menu: None,
             fix_menu_title: "Quick Fixes",
+            fix_menu_create_fn: false,
             chsig: None,
             chsig_refs_gen: None,
             chsig_req_seq: 0,
@@ -3567,6 +3571,7 @@ impl App {
             C::CompleteStatement => self.editor_command(ctx, |v, b, n| v.complete_statement(b, n)),
             C::ExtractVariable => self.extract_variable(ctx),
             C::ExtractFunction => self.extract_function(ctx),
+            C::CreateFunctionFromUsage => self.create_function_from_usage(ctx),
             C::HighlightUsagesInFile => {
                 let g = &mut self.groups[self.focused];
                 let a = g.active;
@@ -3804,6 +3809,7 @@ impl App {
                             .map(|p| egui::pos2(p.x, p.y + 18.0))
                             .or_else(ctx_pointer_pos)
                             .unwrap_or(egui::pos2(200.0, 200.0));
+                        self.fix_menu_create_fn = !refactor && self.create_fn_available();
                         self.fix_menu = Some((anchor, path, sort_actions_by_kind(actions)));
                     }
                 }
@@ -6416,6 +6422,67 @@ impl App {
     }
 
     /// Ctrl+G: open the go-to-line prompt as the only overlay.
+    /// Is the caret on a call this project has no definition or prototype for?
+    ///
+    /// Computed ONCE when the menu opens and cached in `fix_menu_create_fn`. It parses the whole
+    /// buffer, and the menu redraws every frame it is up — asking per frame cost a full
+    /// tree-sitter parse of the file per frame, which is tens of milliseconds of jank on a large
+    /// translation unit for an answer that cannot change while a modal menu has the input.
+    fn create_fn_available(&self) -> bool {
+        let g = &self.groups[self.focused];
+        let Some(f) = g.files.get(g.active).filter(|f| f.loaded) else { return false };
+        if !matches!(f.lang, Some(Lang::C)) {
+            return false;
+        }
+        let Some(psi) = self.psi.index() else { return false };
+        let known = |n: &str| !psi.defs_by_name(n).is_empty() || !psi.decls_by_name(n).is_empty();
+        let src = f.buffer.rope().to_string();
+        cauldron_psi::fromusage::plan(&src, f.view.primary_selection_range().start, &known).is_some()
+    }
+
+    /// Alt+Enter on a call to something that does not exist: write the function.
+    ///
+    /// "Does not exist" is answered by the PSI index, so a call to a function defined in another
+    /// translation unit never offers to redefine it. Without an index we decline rather than risk
+    /// generating a duplicate of something real.
+    fn create_function_from_usage(&mut self, ctx: &egui::Context) {
+        let now = ctx.input(|i| i.time);
+        let g = &self.groups[self.focused];
+        let Some(f) = g.files.get(g.active).filter(|f| f.loaded) else { return };
+        if !matches!(f.lang, Some(Lang::C)) {
+            return;
+        }
+        let path = f.path.clone();
+        let src = f.buffer.rope().to_string();
+        let offset = f.view.primary_selection_range().start;
+        let Some(psi) = self.psi.index() else {
+            self.lsp_message = Some("C index not ready — cannot tell if that function exists".into());
+            return;
+        };
+        // A name is "known" if the index has a definition, a declaration, or a macro for it.
+        // Definitions OR prototypes: a header declaration means the function exists somewhere,
+        // even if its translation unit is not indexed.
+        let known =
+            |n: &str| !psi.defs_by_name(n).is_empty() || !psi.decls_by_name(n).is_empty();
+        let Some(plan) = cauldron_psi::fromusage::plan(&src, offset, &known) else {
+            self.lsp_message = Some("put the caret on a call to an undefined function".into());
+            return;
+        };
+        let edits = vec![cauldron_psi::chsig::Edit {
+            range: plan.insert_at..plan.insert_at,
+            text: plan.text.clone(),
+        }];
+        match self.apply_psi_edits(&path, &edits, now) {
+            Ok(()) => {
+                self.lsp_message = Some(match plan.guessed_types {
+                    true => format!("created `{}` — check the parameter types", plan.name),
+                    false => format!("created `{}`", plan.name),
+                });
+            }
+            Err(e) => self.lsp_message = Some(e),
+        }
+    }
+
     /// Offer Extract Function only where it can work: a C file with a real selection.
     fn extract_function_available(&self) -> bool {
         let g = &self.groups[self.focused];
@@ -8955,6 +9022,7 @@ impl eframe::App for App {
             let mut close_menu = false;
             let mut extract_var = false;
             let mut extract_fn = false;
+            let mut create_fn = false;
             egui::Area::new("quickfixes".into())
                 .fixed_pos(pos)
                 .order(egui::Order::Foreground)
@@ -9017,6 +9085,21 @@ impl eframe::App for App {
                             }
                             ui.separator();
                         }
+                        // Create-from-usage belongs in QUICK FIXES, not Refactor This: it is the
+                        // answer to an error on the line, which is exactly what Alt+Enter is for.
+                        if self.fix_menu_title == "Quick Fixes" && self.fix_menu_create_fn {
+                            if ui
+                                .selectable_label(
+                                    false,
+                                    egui::RichText::new("Create function from usage").size(12.5),
+                                )
+                                .clicked_by(egui::PointerButton::Primary)
+                            {
+                                create_fn = true;
+                                close_menu = true;
+                            }
+                            ui.separator();
+                        }
                         let mut group_shown = "";
                         for (i, action) in actions.iter().enumerate() {
                             let group = action_group(action);
@@ -9054,6 +9137,9 @@ impl eframe::App for App {
             }
             if extract_fn {
                 self.extract_function(ctx);
+            }
+            if create_fn {
+                self.create_function_from_usage(ctx);
             }
             if close_menu || ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
                 self.fix_menu = None;

@@ -123,3 +123,43 @@ static int sum_to(int n)
     }
     assert!(ok > 0, "expected at least one extractable statement in a plain function");
 }
+
+/// The plan is two edits that the app applies as one transaction. Applying them textually here
+/// proves the OFFSETS compose — a plan whose pieces are individually right can still produce
+/// garbage if the insertion shifts the replacement out from under itself.
+#[test]
+fn applying_both_edits_yields_a_file_that_still_parses() {
+    let src = "\
+#include <stdio.h>
+
+static int sum_to(int n)
+{
+    int total = 0;
+    int i = 0;
+    while (i < n) {
+        total += i;
+        i++;
+    }
+    return total;
+}
+";
+    let sel_text = "    while (i < n) {\n        total += i;\n        i++;\n    }";
+    let s = src.find(sel_text).expect("fixture");
+    let p = plan(src, s..s + sel_text.len(), "accumulate").expect("this loop is extractable");
+
+    // Apply descending so the earlier offset stays valid, which is what the app's sorted
+    // single-transaction apply does for real.
+    let mut out = src.to_string();
+    out.replace_range(p.replace.clone(), &p.call_text);
+    out.insert_str(p.insert_at, &p.function_text);
+
+    assert!(parses(&out), "combined result does not parse:\n{out}");
+    assert!(out.contains("accumulate("), "the call must be present:\n{out}");
+    // Moved, not copied: the loop body appears exactly once in the whole file.
+    assert_eq!(out.matches("total += i;").count(), 1, "moved, not copied:\n{out}");
+    assert_eq!(out.matches("while (i < n)").count(), 1, "{out}");
+    // The new function must sit ABOVE its caller, so no prototype is needed.
+    let fn_at = out.find("accumulate(int").expect("definition");
+    let caller_at = out.find("static int sum_to").expect("caller");
+    assert!(fn_at < caller_at, "callee must be declared before use:\n{out}");
+}

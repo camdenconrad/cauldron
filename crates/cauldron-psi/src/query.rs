@@ -137,6 +137,18 @@ impl PsiSnapshot {
             .collect()
     }
 
+    /// Prototype (declaration) sites named `name`. Together with [`Self::find_definitions`] this
+    /// answers "does this function exist anywhere in the project?" — a header prototype counts,
+    /// since the definition may live in a translation unit that is not in the index.
+    pub fn find_declarations(&self, name: &str) -> Vec<Definition> {
+        let mut texts = TextCache::new(&self.overlay);
+        self.index
+            .decls_by_name(name)
+            .iter()
+            .filter_map(|&dref| self.definition_row(dref, &mut texts))
+            .collect()
+    }
+
     /// Definitions of the TYPE `name` — `struct`/`union`/`enum`/`typedef`. Separate from
     /// [`Self::find_definitions`] because C keeps tags in their own namespace: a `struct stat`
     /// and a `stat()` function coexist, and merging them would make each shadow the other.

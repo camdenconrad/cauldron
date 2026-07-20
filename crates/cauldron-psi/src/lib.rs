@@ -16,6 +16,7 @@
 pub mod chsig;
 pub mod collect;
 pub mod extract;
+pub mod fromusage;
 pub mod graph;
 pub mod index;
 pub mod invalidate;
