@@ -43,6 +43,80 @@ mod kind {
     pub const ARGUMENT_LIST: &str = "argument_list";
     pub const AMPERSAND: &str = "&";
     pub const ELLIPSIS: &str = "...";
+    // --- aggregates (verified against the pinned tree-sitter-c with a shape probe) ------------
+    pub const STRUCT_SPECIFIER: &str = "struct_specifier";
+    pub const UNION_SPECIFIER: &str = "union_specifier";
+    pub const ENUM_SPECIFIER: &str = "enum_specifier";
+    pub const FIELD_DECLARATION: &str = "field_declaration";
+    pub const FIELD_IDENTIFIER: &str = "field_identifier";
+    pub const ENUMERATOR: &str = "enumerator";
+    pub const COMPOUND_STATEMENT: &str = "compound_statement";
+    pub const TRANSLATION_UNIT: &str = "translation_unit";
+}
+
+/// The declared type of a node's `type` field as source text, whitespace-collapsed. An aggregate
+/// with a body is trimmed to its HEAD (`struct Tag { … }` -> `struct Tag`) so what we store stays
+/// a type reference rather than an entire definition.
+fn type_text(node: Node, text: &str) -> String {
+    let full = &text[node.byte_range()];
+    let head = match node.kind() {
+        kind::STRUCT_SPECIFIER | kind::UNION_SPECIFIER | kind::ENUM_SPECIFIER => {
+            match node.child_by_field_name("body") {
+                // Everything up to the body: `struct Tag `, or bare `struct` when anonymous.
+                Some(b) => &text[node.start_byte()..b.start_byte()],
+                None => full,
+            }
+        }
+        _ => full,
+    };
+    head.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// Pointer/array/function declarator decoration prepended to a member's stored type, so a
+/// `char *name;` field reads as `char *` rather than `char`.
+fn declarator_suffix(d: Node) -> &'static str {
+    match d.kind() {
+        kind::POINTER_DECLARATOR => " *",
+        kind::ARRAY_DECLARATOR => " []",
+        _ => "",
+    }
+}
+
+/// The `field_identifier` (or `identifier`) a member declarator bottoms out in, unwrapping
+/// pointer / array / parenthesized / function declarators the same way [`declarator_info`] does
+/// for functions.
+/// A name node only if it actually spans characters. tree-sitter emits ZERO-WIDTH identifier
+/// nodes for constructs it is recovering from — an anonymous bitfield, or C++ shapes like
+/// `operator T*()` seen through the C grammar. An empty-named stub is unusable and pollutes
+/// every by-name map, so it must never be created.
+fn nonempty(n: Node) -> Option<Node> {
+    (!n.byte_range().is_empty()).then_some(n)
+}
+
+fn member_name(d: Node) -> Option<Node> {
+    let mut cur = d;
+    loop {
+        match cur.kind() {
+            // An ANONYMOUS bitfield (`unsigned : 7;`) still produces a field_identifier — a
+            // ZERO-WIDTH one. It names nothing and must not become a member.
+            kind::FIELD_IDENTIFIER | kind::IDENTIFIER => {
+                return (!cur.byte_range().is_empty()).then_some(cur)
+            }
+            // `(*run)(int)` nests function_declarator > parenthesized_declarator > pointer_
+            // declarator > field_identifier, and the parenthesized layer exposes NO `declarator`
+            // field — its children are the bare parens and the inner declarator. Descend by
+            // position there, by field everywhere else.
+            kind::PARENTHESIZED_DECLARATOR => cur = cur.named_child(0)?,
+            kind::POINTER_DECLARATOR
+            | kind::ARRAY_DECLARATOR
+            | kind::ATTRIBUTED_DECLARATOR
+            | kind::INIT_DECLARATOR
+            | kind::FUNCTION_DECLARATOR => {
+                cur = cur.child_by_field_name("declarator")?;
+            }
+            _ => return None,
+        }
+    }
 }
 
 /// `caller_stub` value for call/indirect sites outside any function body.
@@ -66,6 +140,39 @@ pub enum StubKind {
     MacroFn,
     MacroObj,
     Typedef,
+    // APPEND-ONLY BELOW. The discriminant is cast to u8 into `interface_hash`; reordering the
+    // variants above would silently change every file's hash and force a full reindex.
+    /// `struct S { … }` — a definition WITH a body.
+    Struct,
+    /// `union U { … }`.
+    Union,
+    /// `enum E { … }`.
+    Enum,
+    /// `struct S;` — a forward declaration, no body.
+    TagDecl,
+    /// One member of a struct/union. `parent` names the aggregate.
+    Field,
+    /// One `enum` constant. `parent` names the enum.
+    Enumerator,
+    /// A file-scope variable with a definition.
+    Global,
+    /// `extern int x;` — a file-scope variable declared elsewhere.
+    GlobalDecl,
+}
+
+impl StubKind {
+    /// Is this a type the user can navigate to (struct/union/enum/typedef)?
+    pub fn is_type(self) -> bool {
+        matches!(
+            self,
+            StubKind::Struct | StubKind::Union | StubKind::Enum | StubKind::TagDecl | StubKind::Typedef
+        )
+    }
+
+    /// Is this a MEMBER of an aggregate rather than a top-level entity?
+    pub fn is_member(self) -> bool {
+        matches!(self, StubKind::Field | StubKind::Enumerator)
+    }
 }
 
 /// One top-level named entity. Plain data — name + kind + spans, never a node handle
@@ -91,6 +198,15 @@ pub struct Stub {
     /// A lone `void` yields NO entries (it means zero parameters, not one named `void`); a
     /// variadic `...` contributes its own span so a rewriter can preserve it.
     pub param_ranges: Vec<Range<usize>>,
+    /// Owning aggregate, as an index into the SAME file's `stubs`. Set for [`StubKind::Field`]
+    /// and [`StubKind::Enumerator`], and for a tag nested inside another aggregate. `None` for
+    /// anything at file scope. An index (not a name) because anonymous aggregates have none.
+    pub parent: Option<u32>,
+    /// Declared type, verbatim source text — `int`, `char *`, `struct Cfg *`. Present for fields,
+    /// globals, and typedefs (where it is the ALIASED type); `None` for everything else. Kept as
+    /// text rather than a parsed type: consumers show it, and C's declarator syntax makes a
+    /// faithful parse a much larger commitment than this slice needs.
+    pub ty: Option<String>,
 }
 
 /// One direct call site: `callee` is a plain identifier at the call position.
@@ -150,6 +266,11 @@ pub fn file_facts(text: &str) -> FileFacts {
         // Byte-driven scopes popped as the pre-order walk moves past their end.
         let mut fn_stack: Vec<(u32, usize)> = Vec::new(); // (FnDef stub idx, end byte)
         let mut err_stack: Vec<usize> = Vec::new(); // ERROR end bytes (nesting guard)
+        // (aggregate stub idx, end byte) for the struct/union/enum whose members we are inside.
+        let mut agg_stack: Vec<(u32, usize)> = Vec::new();
+        // End bytes of every compound_statement, giving an exact "is this file scope?" test.
+        // A block-local `struct` or variable must NOT be indexed as a file-scope entity.
+        let mut block_stack: Vec<usize> = Vec::new();
 
         for_each_preorder(tree.root_node(), &mut |node| {
             let start = node.start_byte();
@@ -158,6 +279,15 @@ pub fn file_facts(text: &str) -> FileFacts {
             }
             while err_stack.last().is_some_and(|&end| end <= start) {
                 err_stack.pop();
+            }
+            while agg_stack.last().is_some_and(|&(_, end)| end <= start) {
+                agg_stack.pop();
+            }
+            while block_stack.last().is_some_and(|&end| end <= start) {
+                block_stack.pop();
+            }
+            if node.kind() == kind::COMPOUND_STATEMENT {
+                block_stack.push(node.end_byte());
             }
             if node.is_error() {
                 if err_stack.is_empty() {
@@ -170,7 +300,7 @@ pub fn file_facts(text: &str) -> FileFacts {
                 kind::FUNCTION_DEFINITION => {
                     if let Some(d) = node.child_by_field_name("declarator") {
                         let info = declarator_info(d);
-                        if let Some(name_node) = info.name {
+                        if let Some(name_node) = info.name.and_then(nonempty) {
                             let idx = stubs.len() as u32;
                             stubs.push(Stub {
                                 name: text[name_node.byte_range()].to_string(),
@@ -185,6 +315,8 @@ pub fn file_facts(text: &str) -> FileFacts {
                                     .params
                                     .map(|p| param_ranges(p, text))
                                     .unwrap_or_default(),
+                                parent: None,
+                                ty: None,
                             });
                             fn_stack.push((idx, node.end_byte()));
                         }
@@ -198,9 +330,40 @@ pub fn file_facts(text: &str) -> FileFacts {
                     for d in decls {
                         let info = declarator_info(d);
                         if !info.is_function {
+                            // A file-scope VARIABLE. Only at file scope: `fn_stack` excludes K&R
+                            // parameter declarations (inside function_definition but outside any
+                            // block) and `block_stack` excludes ordinary locals.
+                            if block_stack.is_empty() && fn_stack.is_empty() {
+                                if let Some(name_node) = member_name(d).and_then(nonempty) {
+                                    // `extern int x;` DECLARES; anything with an initializer, or
+                                    // without `extern`, defines.
+                                    let is_extern = has_storage(node, text, "extern");
+                                    let defines =
+                                        !is_extern || d.kind() == kind::INIT_DECLARATOR;
+                                    stubs.push(Stub {
+                                        name: text[name_node.byte_range()].to_string(),
+                                        kind: match defines {
+                                            true => StubKind::Global,
+                                            false => StubKind::GlobalDecl,
+                                        },
+                                        is_static,
+                                        byte_range: node.byte_range(),
+                                        name_range: name_node.byte_range(),
+                                        name_line: name_node.start_position().row,
+                                        arity: None,
+                                        params_range: None,
+                                        param_ranges: Vec::new(),
+                                        parent: None,
+                                        ty: node
+                                            .child_by_field_name("type")
+                                            .map(|t| type_text(t, text))
+                                            .map(|b| format!("{b}{}", declarator_suffix(d))),
+                                    });
+                                }
+                            }
                             continue; // fn-pointer variables etc. are not declarations of functions
                         }
-                        if let Some(name_node) = info.name {
+                        if let Some(name_node) = info.name.and_then(nonempty) {
                             stubs.push(Stub {
                                 name: text[name_node.byte_range()].to_string(),
                                 kind: StubKind::FnDecl,
@@ -214,6 +377,8 @@ pub fn file_facts(text: &str) -> FileFacts {
                                     .params
                                     .map(|p| param_ranges(p, text))
                                     .unwrap_or_default(),
+                                parent: None,
+                                ty: None,
                             });
                         }
                     }
@@ -223,7 +388,7 @@ pub fn file_facts(text: &str) -> FileFacts {
                     let decls: Vec<Node> =
                         node.children_by_field_name("declarator", &mut cur).collect();
                     for d in decls {
-                        if let Some(name_node) = declarator_info(d).name {
+                        if let Some(name_node) = declarator_info(d).name.and_then(nonempty) {
                             stubs.push(Stub {
                                 name: text[name_node.byte_range()].to_string(),
                                 kind: StubKind::Typedef,
@@ -235,12 +400,110 @@ pub fn file_facts(text: &str) -> FileFacts {
                                 // Typedefs have no parameter_list to rewrite.
                                 params_range: None,
                                 param_ranges: Vec::new(),
+                                parent: None,
+                                // The aliased type: `typedef struct Tag {…} Tag_t` -> "struct Tag {…}"
+                                // is trimmed to its head so the stored text stays a type, not a body.
+                                ty: node
+                                    .child_by_field_name("type")
+                                    .map(|t| type_text(t, text)),
                             });
                         }
                     }
                 }
+                kind::STRUCT_SPECIFIER | kind::UNION_SPECIFIER | kind::ENUM_SPECIFIER => {
+                    // An aggregate with a `body` is a definition; without one it is either a
+                    // forward declaration (`struct S;`) or a mere reference in a type position
+                    // (`struct S *p;`). Only the former two are entities.
+                    let Some(name_node) = node.child_by_field_name("name").and_then(nonempty)
+                    else {
+                        // Anonymous (`typedef struct { … } T;`). It has no name to index, but its
+                        // members still belong to something — push a parentless scope so the
+                        // fields below do not attach to an enclosing aggregate by accident.
+                        if node.child_by_field_name("body").is_some() {
+                            agg_stack.push((u32::MAX, node.end_byte()));
+                        }
+                        return;
+                    };
+                    let has_body = node.child_by_field_name("body").is_some();
+                    // Without a body this is a forward declaration ONLY when it stands alone as a
+                    // statement (`struct S;`, a direct child of the translation unit). Everywhere
+                    // else — `struct S *p;`, a parameter type, a cast — it is just a REFERENCE to
+                    // a type declared elsewhere, and indexing those would bury the real
+                    // declaration under one entry per mention.
+                    let standalone = node.parent().map(|p| p.kind()) == Some(kind::TRANSLATION_UNIT);
+                    if !has_body && !standalone {
+                        return;
+                    }
+                    let kind_of = match (node.kind(), has_body) {
+                        (_, false) => StubKind::TagDecl,
+                        (kind::UNION_SPECIFIER, _) => StubKind::Union,
+                        (kind::ENUM_SPECIFIER, _) => StubKind::Enum,
+                        _ => StubKind::Struct,
+                    };
+                    let idx = stubs.len() as u32;
+                    stubs.push(Stub {
+                        name: text[name_node.byte_range()].to_string(),
+                        kind: kind_of,
+                        is_static: false,
+                        byte_range: node.byte_range(),
+                        name_range: name_node.byte_range(),
+                        name_line: name_node.start_position().row,
+                        arity: None,
+                        params_range: None,
+                        param_ranges: Vec::new(),
+                        parent: agg_stack.last().map(|&(p, _)| p).filter(|p| *p != u32::MAX),
+                        ty: None,
+                    });
+                    if has_body {
+                        agg_stack.push((idx, node.end_byte()));
+                    }
+                }
+                kind::FIELD_DECLARATION => {
+                    let parent = agg_stack.last().map(|&(p, _)| p).filter(|p| *p != u32::MAX);
+                    let base = node.child_by_field_name("type").map(|t| type_text(t, text));
+                    let mut cur = node.walk();
+                    let decls: Vec<Node> =
+                        node.children_by_field_name("declarator", &mut cur).collect();
+                    for d in decls {
+                        // An anonymous bitfield (`unsigned : 5;`) has no declarator child at all,
+                        // so it never reaches here — which is the right outcome: it has no name.
+                        let Some(name_node) = member_name(d).and_then(nonempty) else { continue };
+                        stubs.push(Stub {
+                            name: text[name_node.byte_range()].to_string(),
+                            kind: StubKind::Field,
+                            is_static: false,
+                            byte_range: node.byte_range(),
+                            name_range: name_node.byte_range(),
+                            name_line: name_node.start_position().row,
+                            arity: None,
+                            params_range: None,
+                            param_ranges: Vec::new(),
+                            parent,
+                            ty: base
+                                .as_ref()
+                                .map(|b| format!("{b}{}", declarator_suffix(d))),
+                        });
+                    }
+                }
+                kind::ENUMERATOR => {
+                    if let Some(name_node) = node.child_by_field_name("name").and_then(nonempty) {
+                        stubs.push(Stub {
+                            name: text[name_node.byte_range()].to_string(),
+                            kind: StubKind::Enumerator,
+                            is_static: false,
+                            byte_range: node.byte_range(),
+                            name_range: name_node.byte_range(),
+                            name_line: name_node.start_position().row,
+                            arity: None,
+                            params_range: None,
+                            param_ranges: Vec::new(),
+                            parent: agg_stack.last().map(|&(p, _)| p).filter(|p| *p != u32::MAX),
+                            ty: None,
+                        });
+                    }
+                }
                 kind::PREPROC_FUNCTION_DEF => {
-                    if let Some(name_node) = node.child_by_field_name("name") {
+                    if let Some(name_node) = node.child_by_field_name("name").and_then(nonempty) {
                         let idx = stubs.len() as u32;
                         stubs.push(Stub {
                             name: text[name_node.byte_range()].to_string(),
@@ -256,6 +519,8 @@ pub fn file_facts(text: &str) -> FileFacts {
                             // not rewrite macros, so withhold spans rather than offer bad ones.
                             params_range: None,
                             param_ranges: Vec::new(),
+                            parent: None,
+                            ty: None,
                         });
                         if let Some(v) = node.child_by_field_name("value") {
                             macro_bodies.push((idx, v.byte_range()));
@@ -263,7 +528,7 @@ pub fn file_facts(text: &str) -> FileFacts {
                     }
                 }
                 kind::PREPROC_DEF => {
-                    if let Some(name_node) = node.child_by_field_name("name") {
+                    if let Some(name_node) = node.child_by_field_name("name").and_then(nonempty) {
                         let idx = stubs.len() as u32;
                         stubs.push(Stub {
                             name: text[name_node.byte_range()].to_string(),
@@ -276,6 +541,8 @@ pub fn file_facts(text: &str) -> FileFacts {
                             // Object-like macro: no parameter list at all.
                             params_range: None,
                             param_ranges: Vec::new(),
+                            parent: None,
+                            ty: None,
                         });
                         if let Some(v) = node.child_by_field_name("value") {
                             macro_bodies.push((idx, v.byte_range()));
@@ -343,9 +610,21 @@ fn finish(
     let mut address_taken: Vec<(String, u8)> = taken.into_iter().collect();
     address_taken.sort();
 
-    let mut iface: Vec<(&str, u8, bool, Option<u8>)> = stubs
+    // The tuple carries the PARENT'S NAME and the declared TYPE as well. Without them, changing
+    // `int x;` to `long x;` inside a struct, or moving a field between two structs, left the
+    // interface hash identical — an interface change that dependents would never be told about.
+    let mut iface: Vec<(&str, u8, bool, Option<u8>, Option<&str>, Option<&str>)> = stubs
         .iter()
-        .map(|s| (s.name.as_str(), s.kind as u8, s.is_static, s.arity))
+        .map(|s| {
+            (
+                s.name.as_str(),
+                s.kind as u8,
+                s.is_static,
+                s.arity,
+                s.parent.and_then(|p| stubs.get(p as usize)).map(|p| p.name.as_str()),
+                s.ty.as_deref(),
+            )
+        })
         .collect();
     iface.sort();
     let mut h = DefaultHasher::new();
@@ -462,9 +741,14 @@ fn declarator_info(root: Node) -> DeclInfo {
 
 /// Does a definition/declaration carry `static` storage?
 fn has_static(node: Node, text: &str) -> bool {
+    has_storage(node, text, "static")
+}
+
+/// Does `node` carry the given storage-class specifier (`static`, `extern`, …)?
+fn has_storage(node: Node, text: &str, want: &str) -> bool {
     (0..node.named_child_count())
         .filter_map(|i| node.named_child(i))
-        .any(|c| c.kind() == kind::STORAGE_CLASS_SPECIFIER && &text[c.byte_range()] == "static")
+        .any(|c| c.kind() == kind::STORAGE_CLASS_SPECIFIER && &text[c.byte_range()] == want)
 }
 
 /// Byte span of each parameter in a `parameter_list`, in source order.
@@ -638,6 +922,127 @@ mod tests {
 
     fn stub_names(f: &FileFacts, k: StubKind) -> Vec<&str> {
         f.stubs.iter().filter(|s| s.kind == k).map(|s| s.name.as_str()).collect()
+    }
+
+    /// Members of the aggregate at `stubs[parent_of]`, in declaration order.
+    fn members(f: &FileFacts, agg: &str) -> Vec<(String, Option<String>)> {
+        let Some(ix) = f.stubs.iter().position(|s| s.name == agg && s.kind.is_type()) else {
+            return Vec::new();
+        };
+        f.stubs
+            .iter()
+            .filter(|s| s.parent == Some(ix as u32) && s.kind.is_member())
+            .map(|s| (s.name.clone(), s.ty.clone()))
+            .collect()
+    }
+
+    #[test]
+    fn struct_fields_are_indexed_with_their_types() {
+        let f = file_facts("struct Point { int x; char *name; };\n");
+        assert_eq!(stub_names(&f, StubKind::Struct), vec!["Point"]);
+        assert_eq!(
+            members(&f, "Point"),
+            vec![
+                ("x".to_string(), Some("int".to_string())),
+                // The pointer lives in the DECLARATOR, not the type node — a field typed `char`
+                // would be wrong here.
+                ("name".to_string(), Some("char *".to_string())),
+            ]
+        );
+    }
+
+    #[test]
+    fn union_and_enum_members() {
+        let f = file_facts("union U { int i; float f; };\nenum Color { RED, GREEN = 5 };\n");
+        assert_eq!(stub_names(&f, StubKind::Union), vec!["U"]);
+        assert_eq!(stub_names(&f, StubKind::Enum), vec!["Color"]);
+        assert_eq!(members(&f, "U").len(), 2);
+        let colors: Vec<String> = members(&f, "Color").into_iter().map(|(n, _)| n).collect();
+        assert_eq!(colors, vec!["RED", "GREEN"], "an explicit value must not drop the constant");
+    }
+
+    #[test]
+    fn anonymous_bitfield_has_no_name_and_is_skipped() {
+        let f = file_facts("struct S { unsigned a : 1; unsigned : 7; unsigned b : 1; };\n");
+        let names: Vec<String> = members(&f, "S").into_iter().map(|(n, _)| n).collect();
+        assert_eq!(names, vec!["a", "b"], "the padding field has no name to index");
+    }
+
+    #[test]
+    fn nested_aggregate_is_a_type_not_a_member() {
+        // A completion after `outer.` must offer `in`, never the type `Inner`.
+        let f = file_facts("struct Outer { struct Inner { int y; } in; };\n");
+        let names: Vec<String> = members(&f, "Outer").into_iter().map(|(n, _)| n).collect();
+        assert_eq!(names, vec!["in"]);
+        assert_eq!(members(&f, "Inner").into_iter().map(|(n, _)| n).collect::<Vec<_>>(), vec!["y"]);
+    }
+
+    #[test]
+    fn typedef_records_the_aliased_type() {
+        let f = file_facts("typedef unsigned int u32;\ntypedef struct Tag { int a; } Tag_t;\n");
+        let t: Vec<(&str, Option<&str>)> = f
+            .stubs
+            .iter()
+            .filter(|s| s.kind == StubKind::Typedef)
+            .map(|s| (s.name.as_str(), s.ty.as_deref()))
+            .collect();
+        assert_eq!(t, vec![("u32", Some("unsigned int")), ("Tag_t", Some("struct Tag"))]);
+        // The body is NOT stored in `ty` — a type reference, not a definition.
+        assert_eq!(members(&f, "Tag").into_iter().map(|(n, _)| n).collect::<Vec<_>>(), vec!["a"]);
+    }
+
+    #[test]
+    fn forward_declaration_versus_a_mere_reference() {
+        // `struct Fwd;` declares. `struct Fwd *p;` only MENTIONS — indexing every mention would
+        // bury the real declaration under one row per use.
+        let f = file_facts("struct Fwd;\nstruct Fwd *p;\nvoid g(struct Fwd *q) { }\n");
+        assert_eq!(stub_names(&f, StubKind::TagDecl), vec!["Fwd"], "exactly one");
+    }
+
+    #[test]
+    fn file_scope_globals_but_not_locals() {
+        let src = "static int g_count = 0;\nextern int g_ext;\nint g_def;\n\
+                   void f(void) { int local = 1; struct Tmp { int z; } t; }\n";
+        let f = file_facts(src);
+        assert_eq!(stub_names(&f, StubKind::Global), vec!["g_count", "g_def"]);
+        assert_eq!(stub_names(&f, StubKind::GlobalDecl), vec!["g_ext"]);
+        assert!(
+            !f.stubs.iter().any(|s| s.name == "local"),
+            "a block-local variable is not a file-scope entity"
+        );
+        assert!(f.stubs.iter().find(|s| s.name == "g_count").unwrap().is_static);
+        assert!(!f.stubs.iter().find(|s| s.name == "g_def").unwrap().is_static);
+    }
+
+    #[test]
+    fn function_pointer_field_keeps_its_name() {
+        let f = file_facts("struct Ops { int (*run)(int); void *ctx; };\n");
+        let names: Vec<String> = members(&f, "Ops").into_iter().map(|(n, _)| n).collect();
+        assert_eq!(names, vec!["run", "ctx"]);
+    }
+
+    #[test]
+    fn anonymous_struct_members_do_not_leak_to_an_enclosing_aggregate() {
+        // `typedef struct { … } T;` has no tag. Its fields must not attach to whatever aggregate
+        // happens to be open, and must not crash.
+        let f = file_facts("struct Outer { int a; };\ntypedef struct { int b; } T;\n");
+        let names: Vec<String> = members(&f, "Outer").into_iter().map(|(n, _)| n).collect();
+        assert_eq!(names, vec!["a"], "`b` belongs to the anonymous struct, not Outer");
+    }
+
+    #[test]
+    fn interface_hash_notices_a_field_type_change() {
+        // Widening a field is an INTERFACE change; dependents must be told.
+        let a = file_facts("struct S { int x; };\n");
+        let b = file_facts("struct S { long x; };\n");
+        assert_ne!(a.interface_hash, b.interface_hash);
+    }
+
+    #[test]
+    fn interface_hash_notices_a_field_moving_between_structs() {
+        let a = file_facts("struct A { int x; };\nstruct B { int y; };\n");
+        let b = file_facts("struct A { int y; };\nstruct B { int x; };\n");
+        assert_ne!(a.interface_hash, b.interface_hash, "parent name is part of the interface");
     }
 
     #[test]

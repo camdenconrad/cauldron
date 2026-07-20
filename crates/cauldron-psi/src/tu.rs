@@ -281,6 +281,10 @@ fn fold_tu(
             // and a rewriter must not be handed coordinates that look usable but are not.
             params_range: None,
             param_ranges: Vec::new(),
+            // The TU path re-attributes stubs to origin lines; a member's parent index refers to
+            // the ORIGINAL file's stub vector and would be meaningless here.
+            parent: None,
+            ty: None,
         });
         acc.stub_ix.insert(key, ix);
         placed.push(Some((path, ix)));

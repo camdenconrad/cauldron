@@ -451,7 +451,19 @@ fn psi_symbol_entries(index: &PsiIndex) -> Vec<SymbolEntry> {
                 StubKind::FnDef => SymKind::Function,
                 StubKind::MacroFn | StubKind::MacroObj => SymKind::Define,
                 StubKind::Typedef => SymKind::TypeDef,
-                StubKind::FnDecl => continue,
+                // The PSI tier can finally produce these; before, struct/enum rows in goto-symbol
+                // came only from the regex fallback tier.
+                StubKind::Struct | StubKind::Union => SymKind::Struct,
+                StubKind::Enum => SymKind::Enum,
+                StubKind::Global => SymKind::Const,
+                // Not goto-symbol targets: prototypes and forward declarations point AT the real
+                // definition, and members are found through their aggregate, not as top-level
+                // rows that would swamp the list (a cFS tree has tens of thousands of fields).
+                StubKind::FnDecl
+                | StubKind::TagDecl
+                | StubKind::GlobalDecl
+                | StubKind::Field
+                | StubKind::Enumerator => continue,
             };
             out.push(SymbolEntry {
                 name: stub.name.clone(),

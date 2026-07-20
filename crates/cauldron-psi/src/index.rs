@@ -51,6 +51,15 @@ pub struct Index {
     syms: Interner,
     defs_by_name: HashMap<Sym, Vec<DefRef>>,
     decls_by_name: HashMap<Sym, Vec<DefRef>>,
+    /// Tag/typedef name -> its definitions. SEPARATE from `defs_by_name` on purpose: C keeps
+    /// tags in their own namespace (`struct stat` and `stat()` coexist), and Change Signature
+    /// resolves its anchor through `defs_by_name` and errors on a non-function.
+    types_by_name: HashMap<Sym, Vec<DefRef>>,
+    /// Field / enumerator name -> every declaration of it, across all aggregates. Same name in
+    /// two structs yields two entries; the caller disambiguates by `Stub::parent`.
+    members_by_name: HashMap<Sym, Vec<DefRef>>,
+    /// File-scope variable name -> its definitions and `extern` declarations.
+    globals_by_name: HashMap<Sym, Vec<DefRef>>,
     /// Callee name -> every call site targeting it (materialized inverse of `FileFacts::calls`).
     callers_of: HashMap<Sym, Vec<(FileId, CallSite)>>,
     /// Ident name -> files mentioning it (defs, decls, macros, typedefs, callees,
@@ -99,7 +108,25 @@ impl Index {
                 StubKind::FnDecl => {
                     self.decls_by_name.entry(sym).or_default().push(dref);
                 }
-                StubKind::Typedef => {}
+                // Types get their OWN map. Folding them into `defs_by_name` would break Change
+                // Signature, which takes the first resolvable def/decl as its anchor and hard-
+                // errors when it is not a function — and C tags live in a separate namespace, so
+                // `struct stat` and a `stat()` function legitimately share a name.
+                StubKind::Struct
+                | StubKind::Union
+                | StubKind::Enum
+                | StubKind::TagDecl
+                | StubKind::Typedef => {
+                    self.types_by_name.entry(sym).or_default().push(dref);
+                }
+                // Members are reachable through their parent aggregate, and by name for
+                // find-usages; they are never top-level definitions.
+                StubKind::Field | StubKind::Enumerator => {
+                    self.members_by_name.entry(sym).or_default().push(dref);
+                }
+                StubKind::Global | StubKind::GlobalDecl => {
+                    self.globals_by_name.entry(sym).or_default().push(dref);
+                }
             }
             push_ident(&mut self.files_with_ident, sym, fid);
         }
@@ -162,6 +189,21 @@ impl Index {
     /// Definition sites (functions + macros) named `name`, in FileId/stub order.
     pub fn defs_by_name(&self, name: &str) -> &[DefRef] {
         self.lookup(name).and_then(|s| self.defs_by_name.get(&s)).map_or(&[], Vec::as_slice)
+    }
+
+    /// Type (struct/union/enum/typedef) definitions named `name`.
+    pub fn types_by_name(&self, name: &str) -> &[DefRef] {
+        self.lookup(name).and_then(|s| self.types_by_name.get(&s)).map_or(&[], Vec::as_slice)
+    }
+
+    /// Field / enumerator declarations named `name`, across every aggregate that has one.
+    pub fn members_by_name(&self, name: &str) -> &[DefRef] {
+        self.lookup(name).and_then(|s| self.members_by_name.get(&s)).map_or(&[], Vec::as_slice)
+    }
+
+    /// File-scope variable definitions and `extern` declarations named `name`.
+    pub fn globals_by_name(&self, name: &str) -> &[DefRef] {
+        self.lookup(name).and_then(|s| self.globals_by_name.get(&s)).map_or(&[], Vec::as_slice)
     }
 
     /// Declaration (prototype) sites named `name`.

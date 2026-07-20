@@ -778,6 +778,8 @@ mod tests {
             arity,
             params_range: None,
             param_ranges: Vec::new(),
+            parent: None,
+            ty: None,
         }
     }
 

@@ -79,6 +79,18 @@ pub struct Definition {
     pub is_static: bool,
 }
 
+/// One member of an aggregate: a struct/union field, or an enum constant.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Member {
+    pub name: String,
+    /// Declared type as source text (`int`, `char *`). `None` for enum constants.
+    pub ty: Option<String>,
+    pub kind: StubKind,
+    /// 0-based line of the member's name.
+    pub line: usize,
+    pub name_range: Range<usize>,
+}
+
 /// A generation-stamped view over one retained index snapshot. Construction is an Arc clone +
 /// one u64 read; all queries are map lookups plus on-demand disk reads of the touched files.
 pub struct PsiSnapshot {
@@ -120,6 +132,65 @@ impl PsiSnapshot {
         let mut texts = TextCache::new(&self.overlay);
         self.index
             .defs_by_name(name)
+            .iter()
+            .filter_map(|&dref| self.definition_row(dref, &mut texts))
+            .collect()
+    }
+
+    /// Definitions of the TYPE `name` — `struct`/`union`/`enum`/`typedef`. Separate from
+    /// [`Self::find_definitions`] because C keeps tags in their own namespace: a `struct stat`
+    /// and a `stat()` function coexist, and merging them would make each shadow the other.
+    pub fn find_types(&self, name: &str) -> Vec<Definition> {
+        let mut texts = TextCache::new(&self.overlay);
+        self.index
+            .types_by_name(name)
+            .iter()
+            .filter_map(|&dref| self.definition_row(dref, &mut texts))
+            .collect()
+    }
+
+    /// The MEMBERS of the aggregate `name`, in declaration order: fields for a struct/union,
+    /// constants for an enum. Empty when the type is unknown or has no body.
+    ///
+    /// Nested aggregates are excluded — `struct Outer { struct Inner { … } in; }` yields the
+    /// field `in`, not the type `Inner`, because a member list is what a completion popup after
+    /// `outer.` should offer.
+    pub fn members_of(&self, name: &str) -> Vec<Member> {
+        let mut out = Vec::new();
+        for &dref in self.index.types_by_name(name) {
+            let Some(facts) = self.index.facts(dref.file) else { continue };
+            for stub in facts.stubs.iter().filter(|s| s.parent == Some(dref.stub)) {
+                if !stub.kind.is_member() {
+                    continue; // a nested tag is not a member of its enclosing aggregate
+                }
+                out.push(Member {
+                    name: stub.name.clone(),
+                    ty: stub.ty.clone(),
+                    kind: stub.kind,
+                    line: stub.name_line,
+                    name_range: stub.name_range.clone(),
+                });
+            }
+        }
+        out
+    }
+
+    /// Every declaration of a field or enum constant named `name`, across all aggregates.
+    /// Two structs with a `status` field yield two rows — the caller disambiguates.
+    pub fn find_members(&self, name: &str) -> Vec<Definition> {
+        let mut texts = TextCache::new(&self.overlay);
+        self.index
+            .members_by_name(name)
+            .iter()
+            .filter_map(|&dref| self.definition_row(dref, &mut texts))
+            .collect()
+    }
+
+    /// Definitions (and `extern` declarations) of the file-scope variable `name`.
+    pub fn find_globals(&self, name: &str) -> Vec<Definition> {
+        let mut texts = TextCache::new(&self.overlay);
+        self.index
+            .globals_by_name(name)
             .iter()
             .filter_map(|&dref| self.definition_row(dref, &mut texts))
             .collect()

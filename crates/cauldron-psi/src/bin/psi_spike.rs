@@ -69,6 +69,7 @@ fn main() {
     let mut direct_calls = 0usize;
     let mut mined_calls = 0usize;
     let mut indirect_sites = 0usize;
+    let mut aggregates: std::collections::BTreeMap<String, usize> = Default::default();
     let mut taken_names: HashSet<&str> = HashSet::new();
     for (_, _, f) in &per_file {
         for s in &f.stubs {
@@ -78,6 +79,9 @@ fn main() {
                 StubKind::MacroFn => macro_fns += 1,
                 StubKind::MacroObj => macro_objs += 1,
                 StubKind::Typedef => typedefs += 1,
+                // The spike reports the original five counters; aggregates and members are
+                // summarized separately below rather than being folded into them.
+                other => *aggregates.entry(format!("{other:?}")).or_insert(0usize) += 1,
             }
         }
         for c in &f.calls {
