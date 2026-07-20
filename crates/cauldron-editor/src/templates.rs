@@ -138,6 +138,49 @@ static PY_POSTFIX: &[Template] = &[
     Template { key: "print", about: "print(expr)", body: "print($E)$0" },
 ];
 
+/// Surround-with templates: wrap the SELECTION rather than an expression before the caret.
+/// `$E` is the selected text, re-indented one level in by the caller.
+pub fn surround_templates(lang: Option<Lang>) -> &'static [Template] {
+    match lang {
+        Some(Lang::C) | Some(Lang::Cpp) => C_SURROUND,
+        Some(Lang::Rust) => RUST_SURROUND,
+        Some(Lang::Python) => PY_SURROUND,
+        _ => GENERIC_SURROUND,
+    }
+}
+
+static C_SURROUND: &[Template] = &[
+    Template { key: "if", about: "if (…) { … }", body: "if (${1:cond}) {\n$E\n}" },
+    Template { key: "while", about: "while (…) { … }", body: "while (${1:cond}) {\n$E\n}" },
+    Template {
+        key: "for",
+        about: "for (…) { … }",
+        body: "for (int ${1:i} = 0; ${1:i} < ${2:n}; ${1:i}++) {\n$E\n}",
+    },
+    Template { key: "block", about: "{ … }", body: "{\n$E\n}" },
+    Template { key: "ifdef", about: "#ifdef … #endif", body: "#ifdef ${1:MACRO}\n$E\n#endif" },
+    Template { key: "comment", about: "/* … */", body: "/*\n$E\n*/" },
+];
+
+static RUST_SURROUND: &[Template] = &[
+    Template { key: "if", about: "if … { … }", body: "if ${1:cond} {\n$E\n}" },
+    Template { key: "loop", about: "loop { … }", body: "loop {\n$E\n}" },
+    Template { key: "for", about: "for … { … }", body: "for ${1:x} in ${2:it} {\n$E\n}" },
+    Template { key: "block", about: "{ … }", body: "{\n$E\n}" },
+    Template { key: "unsafe", about: "unsafe { … }", body: "unsafe {\n$E\n}" },
+    Template { key: "comment", about: "/* … */", body: "/*\n$E\n*/" },
+];
+
+static PY_SURROUND: &[Template] = &[
+    Template { key: "if", about: "if …:", body: "if ${1:cond}:\n$E" },
+    Template { key: "for", about: "for …:", body: "for ${1:x} in ${2:it}:\n$E" },
+    Template { key: "while", about: "while …:", body: "while ${1:cond}:\n$E" },
+    Template { key: "try", about: "try / except", body: "try:\n$E\nexcept ${1:Exception}:\n    pass" },
+];
+
+static GENERIC_SURROUND: &[Template] =
+    &[Template { key: "block", about: "{ … }", body: "{\n$E\n}" }];
+
 /// A postfix expansion resolved against the text before the caret.
 #[derive(Debug, PartialEq, Eq)]
 pub struct PostfixHit {

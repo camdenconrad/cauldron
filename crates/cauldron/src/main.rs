@@ -790,6 +790,10 @@ struct App {
     peek: Option<(PathBuf, usize, String)>,
     /// The next `textDocument/definition` answer belongs to the peek popup, not to navigation.
     peek_pending: bool,
+    /// Surround With picker: the highlighted row, or None when closed.
+    surround: Option<usize>,
+    /// Pending Safe Delete confirmation.
+    safe_delete: Option<SafeDelete>,
     /// Where the most recent buffer change landed — the Ctrl+Shift+Backspace target. Survives
     /// navigating away, which is the entire point: it is how you get back to what you were
     /// writing after chasing a definition across the tree.
@@ -1080,6 +1084,8 @@ impl App {
             goto_line: None,
             peek: None,
             peek_pending: false,
+            surround: None,
+            safe_delete: None,
             last_edit: None,
             rename: None,
             rename_lang: None,
@@ -3720,6 +3726,8 @@ impl App {
             C::GenerateDefinition => self.generate_definition(ctx),
             C::MoveStatementUp => self.editor_command(ctx, |v, b, n| v.move_statement(b, false, n)),
             C::MoveStatementDown => self.editor_command(ctx, |v, b, n| v.move_statement(b, true, n)),
+            C::SafeDelete => self.safe_delete(),
+            C::SurroundWith => self.open_surround(),
             C::QuickDefinition => self.quick_definition(ctx),
             C::NextProblem => self.goto_next_problem(true),
             C::PrevProblem => self.goto_next_problem(false),
@@ -6811,6 +6819,225 @@ impl App {
         }
     }
 
+    /// Alt+Delete: delete the symbol under the caret, but only after showing what still uses it.
+    ///
+    /// The check is the whole feature. Deleting a function is easy; discovering three months later
+    /// that something called it is not. Usages come from the PSI index (C) — the answer must be
+    /// synchronous, because a prompt that appears after the user has moved on is worse than none.
+    fn safe_delete(&mut self) {
+        let g = &self.groups[self.focused];
+        let Some(f) = g.files.get(g.active).filter(|f| f.loaded) else { return };
+        if !matches!(f.lang, Some(Lang::C)) {
+            self.lsp_message = Some("Safe Delete is C-only for now".into());
+            return;
+        }
+        let rope = f.buffer.rope().clone();
+        let name = ident_at(&rope, f.view.caret_byte());
+        if name.is_empty() {
+            self.lsp_message = Some("put the caret on a symbol".into());
+            return;
+        }
+        let Some(psi) = self.psi.index() else {
+            self.lsp_message = Some("C index not ready — cannot check for usages".into());
+            return;
+        };
+        // Through a snapshot, with dirty buffers overlaid: the definition span must be in the
+        // coordinate space of the text we are about to edit, not of the last saved copy.
+        let overlay: HashMap<PathBuf, String> = self
+            .groups
+            .iter()
+            .flat_map(|g| g.files.iter())
+            .filter(|f| f.dirty)
+            .map(|f| (f.path.clone(), f.buffer.rope().to_string()))
+            .collect();
+        let snap = cauldron_psi::query::PsiSnapshot::with_overlay(psi, overlay);
+        let defs = snap.find_definitions(&name);
+        let Some(def) = defs.into_iter().next() else {
+            self.lsp_message = Some(format!("no definition of `{name}` in the index"));
+            return;
+        };
+        // Every call site, minus the ones INSIDE the definition being removed: a recursive
+        // function calls itself, and counting that as an external user would block every delete.
+        // Usages carry lines rather than byte ranges, so the definition's span is converted to a
+        // line range in the same text the edit will be applied to.
+        let def_text = match self.find_file_mut(&def.path).filter(|f| f.loaded) {
+            Some(f) => f.buffer.rope().to_string(),
+            None => std::fs::read_to_string(&def.path).unwrap_or_default(),
+        };
+        let line_of = |b: usize| def_text[..b.min(def_text.len())].matches('\n').count();
+        let (first, last) = (line_of(def.byte_range.start), line_of(def.byte_range.end));
+        let uses: Vec<_> = snap
+            .callers(&name)
+            .into_iter()
+            .filter(|u| !(u.path == def.path && u.line >= first && u.line <= last))
+            .collect();
+        self.safe_delete = Some(SafeDelete { name, def_path: def.path, def_range: def.byte_range, uses });
+    }
+
+    /// The Safe Delete confirmation.
+    fn safe_delete_ui(&mut self, ctx: &egui::Context) {
+        let Some(sd) = self.safe_delete.clone() else { return };
+        let mut go = false;
+        let mut cancel = false;
+        egui::Window::new("Safe Delete")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+            .show(ctx, |ui| {
+                ui.label(
+                    egui::RichText::new(format!("Delete `{}`?", sd.name)).size(13.5).strong(),
+                );
+                ui.add_space(4.0);
+                if sd.uses.is_empty() {
+                    ui.colored_label(colors::TEXT_MUTED(), "No usages found.");
+                } else {
+                    ui.colored_label(
+                        colors::ERROR(),
+                        format!("{} usage(s) would be left dangling:", sd.uses.len()),
+                    );
+                    egui::ScrollArea::vertical().max_height(220.0).show(ui, |ui| {
+                        for u in sd.uses.iter().take(50) {
+                            ui.label(
+                                egui::RichText::new(format!(
+                                    "{}:{}",
+                                    u.path.file_name().unwrap_or_default().to_string_lossy(),
+                                    u.line + 1
+                                ))
+                                .monospace()
+                                .size(11.5),
+                            );
+                        }
+                    });
+                }
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    // Deleting anyway is allowed — sometimes the callers are going too — but it
+                    // is never the default action.
+                    let label = match sd.uses.is_empty() {
+                        true => "Delete",
+                        false => "Delete anyway",
+                    };
+                    if ui.button(label).clicked_by(egui::PointerButton::Primary) {
+                        go = true;
+                    }
+                    if ui.button("Cancel").clicked_by(egui::PointerButton::Primary) {
+                        cancel = true;
+                    }
+                });
+            });
+        if go {
+            let now = ctx.input(|i| i.time);
+            let edits = vec![cauldron_psi::chsig::Edit {
+                range: sd.def_range.clone(),
+                text: String::new(),
+            }];
+            match self.apply_psi_edits(&sd.def_path, &edits, now) {
+                Ok(()) => self.lsp_message = Some(format!("deleted `{}`", sd.name)),
+                Err(e) => self.lsp_message = Some(e),
+            }
+            self.safe_delete = None;
+        }
+        if cancel || ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            self.safe_delete = None;
+        }
+    }
+
+    /// Ctrl+Alt+T: offer the constructs that can wrap the selection.
+    fn open_surround(&mut self) {
+        let g = &self.groups[self.focused];
+        let Some(f) = g.files.get(g.active).filter(|f| f.loaded) else { return };
+        if f.view.primary_selection_range().is_empty() {
+            self.lsp_message = Some("select the lines to surround".into());
+            return;
+        }
+        self.surround = Some(0);
+    }
+
+    /// The Surround With picker. Arrows move, Enter applies, Escape cancels — the same shape as
+    /// the fix menu, and for the same reason: this is a keyboard action.
+    fn surround_ui(&mut self, ctx: &egui::Context) {
+        let Some(mut sel) = self.surround else { return };
+        let lang = self.groups[self.focused]
+            .files
+            .get(self.groups[self.focused].active)
+            .and_then(|f| f.lang);
+        let templates = cauldron_editor::templates::surround_templates(lang);
+        if templates.is_empty() {
+            self.surround = None;
+            return;
+        }
+        let (up, down, enter, esc) = ctx.input(|i| {
+            (
+                i.key_pressed(egui::Key::ArrowUp),
+                i.key_pressed(egui::Key::ArrowDown),
+                i.key_pressed(egui::Key::Enter),
+                i.key_pressed(egui::Key::Escape),
+            )
+        });
+        if down {
+            sel = (sel + 1) % templates.len();
+        }
+        if up {
+            sel = (sel + templates.len() - 1) % templates.len();
+        }
+        let mut chosen: Option<&'static str> = enter.then(|| templates[sel].body);
+        let anchor = self
+            .groups
+            .get_mut(self.focused)
+            .and_then(|g| g.active_file())
+            .and_then(|f| f.view.caret_screen_pos())
+            .map(|p| egui::pos2(p.x, p.y + 20.0))
+            .unwrap_or(egui::pos2(300.0, 200.0));
+        egui::Area::new("surround".into())
+            .fixed_pos(anchor)
+            .order(egui::Order::Foreground)
+            .show(ctx, |ui| {
+                egui::Frame::popup(ui.style()).show(ui, |ui| {
+                    ui.set_min_width(240.0);
+                    style::panel_header_inline(ui, "Surround With");
+                    for (i, t) in templates.iter().enumerate() {
+                        let mut job = egui::text::LayoutJob::default();
+                        let font = egui::TextStyle::Monospace.resolve(ui.style());
+                        job.append(
+                            &format!("{:<9}", t.key),
+                            0.0,
+                            egui::TextFormat {
+                                font_id: font.clone(),
+                                color: colors::TEXT(),
+                                ..Default::default()
+                            },
+                        );
+                        job.append(
+                            t.about,
+                            0.0,
+                            egui::TextFormat {
+                                font_id: font,
+                                color: colors::TEXT_FAINT(),
+                                ..Default::default()
+                            },
+                        );
+                        if ui.selectable_label(i == sel, job).clicked_by(egui::PointerButton::Primary)
+                        {
+                            chosen = Some(t.body);
+                        }
+                    }
+                });
+            });
+        if let Some(body) = chosen {
+            let now = ctx.input(|i| i.time);
+            let g = &mut self.groups[self.focused];
+            let a = g.active;
+            if let Some(f) = g.files.get_mut(a) {
+                f.view.surround_with(&mut f.buffer, body, now);
+            }
+            self.surround = None;
+        } else if esc {
+            self.surround = None;
+        } else {
+            self.surround = Some(sel);
+        }
+    }
+
     /// Ctrl+Shift+I: ask for the definition, but show it in a popup instead of navigating.
     fn quick_definition(&mut self, _ctx: &egui::Context) {
         let g = &self.groups[self.focused];
@@ -7146,7 +7373,8 @@ impl App {
         // completion/def popups where Enter stays a newline — so it suppresses both. The
         // Alt+Enter fix menu is the same shape: its arrows move the selection and its Enter
         // invokes, so the editor must not also move the caret or insert a line.
-        let recent_open = self.recent_locations.is_some() || self.fix_menu.is_some();
+        let recent_open =
+            self.recent_locations.is_some() || self.fix_menu.is_some() || self.surround.is_some();
         if let Some(f) = self.groups[self.focused].active_file() {
             f.view.suppress_nav_keys = open || recent_open;
             if recent_open {
@@ -8001,6 +8229,14 @@ impl eframe::App for App {
         // Ctrl+F2 = stop, JetBrains' binding. Harmless when nothing is running.
         if cmd(egui::Key::F2) {
             self.stop_run();
+        }
+        // Alt+Delete = Safe Delete.
+        if ctx.input(|i| i.modifiers.alt && i.key_pressed(egui::Key::Delete)) {
+            self.safe_delete();
+        }
+        // Ctrl+Alt+T = Surround With.
+        if ctx.input(|i| i.modifiers.command && i.modifiers.alt && i.key_pressed(egui::Key::T)) {
+            self.open_surround();
         }
         // Ctrl+Shift+I = Quick Definition (peek without navigating).
         if ctx.input(|i| i.modifiers.command && i.modifiers.shift && i.key_pressed(egui::Key::I)) {
@@ -9782,6 +10018,8 @@ impl eframe::App for App {
         }
         self.disk_conflict_ui(ctx);
         self.peek_ui(ctx);
+        self.surround_ui(ctx);
+        self.safe_delete_ui(ctx);
         // Command palette: draw, and run whatever action was chosen.
         if let Some(cmd) = self.palette.ui(ctx) {
             self.run_command(cmd, ctx);
@@ -11415,6 +11653,15 @@ fn counterpart_path(path: &Path) -> Option<PathBuf> {
         }
     }
     None
+}
+
+/// A pending Safe Delete: what is being removed, and what still uses it.
+#[derive(Clone)]
+struct SafeDelete {
+    name: String,
+    def_path: PathBuf,
+    def_range: std::ops::Range<usize>,
+    uses: Vec<cauldron_psi::query::Usage>,
 }
 
 /// Why a proposed rename is questionable. Fatal blocks the commit; Warn does not — plenty of

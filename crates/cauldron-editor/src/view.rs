@@ -1957,6 +1957,51 @@ impl EditorView {
         }
     }
 
+    /// Ctrl+Alt+T: wrap the selection in the chosen construct.
+    ///
+    /// The selected lines are indented one level in, and the wrapper takes the selection's own
+    /// indentation — so surrounding an already-indented block does not flatten it against the
+    /// margin. Returns false when there is nothing selected.
+    pub fn surround_with(&mut self, buffer: &mut Buffer, body: &str, now: f64) -> bool {
+        let sel = self.selections.primary().range();
+        if sel.is_empty() || self.selections.ranges.len() != 1 {
+            return false;
+        }
+        let rope = buffer.rope().clone();
+        // Whole lines: wrapping half a line in an `if` produces something that does not compile.
+        let first = rope.byte_to_line(sel.start);
+        let mut last = rope.byte_to_line(sel.end);
+        if last > first && rope.line_to_byte(last) == sel.end {
+            last -= 1;
+        }
+        let start = rope.line_to_byte(first);
+        let end = line_content_end_at(&rope, rope.line_to_byte(last));
+        let indent = leading_ws(&rope, start);
+        let inner: String = rope.byte_slice(start..end).into();
+        // Step the selected text in one level, keeping its internal shape.
+        let stepped = inner
+            .split('\n')
+            .map(|l| match l.trim().is_empty() {
+                true => String::new(),
+                false => format!("{TAB}{l}"),
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        // Indent the WRAPPER's own lines only. The `$E` lines already carry absolute
+        // indentation (they came from the file and were stepped in above), so running the whole
+        // thing through reindent would double theirs.
+        let snippet = body
+            .split('\n')
+            .map(|l| match l.trim() == "$E" {
+                true => stepped.clone(),
+                false => format!("{indent}{l}"),
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        self.insert_snippet(buffer, start..end, &snippet, now);
+        true
+    }
+
     /// Tab on a bare caret: expand a postfix or live template, returning whether one fired.
     ///
     /// Postfix is tried FIRST. `x.if` ends in a word that is also a live-template key in several
@@ -3161,6 +3206,58 @@ impl EditorView {
             let cur_blank = eol == rope.line_to_byte(line);
             let next_rest_empty = rope.byte(next_ws.min(rope.len_bytes().saturating_sub(1))) == b'\n'
                 || next_ws >= rope.len_bytes();
+            // --- the smart cases -------------------------------------------------------------
+            // These are what separate a join from "delete the newline". Each looks only at the
+            // two lines being joined, so they compose with the plain case above.
+            let cur_text: String = rope.byte_slice(rope.line_to_byte(line)..eol).into();
+            let next_end = line_content_end(&rope, line + 1);
+            let next_text: String = rope.byte_slice(next_ws..next_end.max(next_ws)).into();
+            let cur_trim = cur_text.trim_end();
+            let next_trim = next_text.trim_start();
+
+            // 1. Adjacent string literals concatenate: `"a"` + `"b"` -> `"ab"`. Joining them with
+            //    a space would leave two literals where the user wanted one.
+            if cur_trim.ends_with('"') && next_trim.starts_with('"') && !cur_trim.ends_with("\\\"") {
+                changes.push(Change {
+                    start: eol - 1,
+                    end: next_ws + 1,
+                    text: String::new(),
+                });
+                continue;
+            }
+            // 2. Continuing a block comment: drop the leading `*` so the joined line reads as
+            //    prose rather than `text * more text`.
+            if next_trim.starts_with('*') && !next_trim.starts_with("*/") && cur_trim.contains("/*")
+            {
+                let star = next_ws + (next_text.len() - next_trim.len()) + 1;
+                let after: usize = rope
+                    .byte_slice(star..next_end.max(star))
+                    .chars()
+                    .take_while(|c| *c == ' ')
+                    .map(char::len_utf8)
+                    .sum();
+                changes.push(Change { start: eol, end: star + after, text: " ".into() });
+                continue;
+            }
+            // 3. A line comment absorbed into the line above keeps its marker only if the line
+            //    above is not already a comment; two `//` on one line is not a comment, it is a
+            //    comment containing a `//`.
+            if let Some(tok) = self.lang.and_then(|l| l.line_comment()) {
+                if next_trim.starts_with(tok) && cur_trim.contains(tok) {
+                    let skip = next_ws + (next_text.len() - next_trim.len()) + tok.len();
+                    let after: usize = rope
+                        .byte_slice(skip..next_end.max(skip))
+                        .chars()
+                        .take_while(|c| *c == ' ')
+                        .map(char::len_utf8)
+                        .sum();
+                    changes.push(Change { start: eol, end: skip + after, text: " ".into() });
+                    continue;
+                }
+            }
+            // 4. A trailing `{` swallows the next line only when it is the block's single
+            //    statement AND the line after closes it — otherwise joining produces `{ stmt`
+            //    with a stranded brace.
             let sep = if cur_blank || next_rest_empty { "" } else { " " };
             changes.push(Change { start: eol, end: next_ws, text: sep.to_string() });
         }
@@ -5084,6 +5181,28 @@ mod tests {
     }
 
     #[test]
+    fn surround_wraps_whole_lines_and_steps_them_in() {
+        let (mut v, mut b) = setup("    one();\n    two();\n");
+        v.selections =
+            Selections { ranges: vec![Selection { anchor: 4, head: 18, goal_col: None }], primary: 0 };
+        let ok = v.surround_with(&mut b, "if (${1:cond}) {\n$E\n}", 0.0);
+        assert!(ok);
+        assert_eq!(
+            b.rope().to_string(),
+            "    if (cond) {\n        one();\n        two();\n    }\n",
+            "wrapper takes the selection's indent; the body steps in one level"
+        );
+    }
+
+    #[test]
+    fn surround_needs_a_selection() {
+        let (mut v, mut b) = setup("    one();\n");
+        v.selections = Selections::single(4);
+        assert!(!v.surround_with(&mut b, "{\n$E\n}", 0.0));
+        assert_eq!(b.rope().to_string(), "    one();\n", "buffer untouched");
+    }
+
+    #[test]
     fn tab_expands_a_live_template() {
         let (mut v, mut b) = setup("for");
         v.selections = Selections::single(3);
@@ -6004,6 +6123,41 @@ mod tests {
             Selections { ranges: vec![Selection { anchor: 2, head: 6, goal_col: None }], primary: 0 };
         v.move_lines(&mut b, true, 0.0);
         assert_eq!(b.rope().to_string(), "1\n4\n2\n3\n", "the 2-line block jumped past 4");
+    }
+
+    #[test]
+    fn join_concatenates_adjacent_string_literals() {
+        // Two literals joined with a space stay two literals; the point of joining them is one.
+        let (mut v, mut b) = setup("    \"hello \"\n    \"world\"\n");
+        v.selections = Selections::single(6);
+        v.join_lines(&mut b, 0.0);
+        assert_eq!(b.rope().to_string(), "    \"hello world\"\n");
+    }
+
+    #[test]
+    fn join_drops_the_leading_star_of_a_block_comment() {
+        let (mut v, mut b) = setup("    /* first\n     * second\n     */\n");
+        v.selections = Selections::single(6);
+        v.join_lines(&mut b, 0.0);
+        assert_eq!(b.rope().to_string(), "    /* first second\n     */\n");
+    }
+
+    #[test]
+    fn join_drops_a_duplicate_line_comment_marker() {
+        // `// a // b` is not two comments, it is one comment containing a `//`.
+        let (mut v, mut b) = setup("// first\n// second\n");
+        v.selections = Selections::single(2);
+        v.join_lines(&mut b, 0.0);
+        assert_eq!(b.rope().to_string(), "// first second\n");
+    }
+
+    #[test]
+    fn join_keeps_a_comment_marker_when_the_line_above_is_code() {
+        // Here the marker is load-bearing: dropping it would turn a comment into code.
+        let (mut v, mut b) = setup("int x = 1;\n// note\n");
+        v.selections = Selections::single(2);
+        v.join_lines(&mut b, 0.0);
+        assert_eq!(b.rope().to_string(), "int x = 1; // note\n");
     }
 
     #[test]
