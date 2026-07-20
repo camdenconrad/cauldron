@@ -141,6 +141,18 @@ impl Buffer {
         inverse
     }
 
+    /// Apply a transaction WITHOUT filing it in history, and clear the history entirely.
+    ///
+    /// For content that came from outside the editor — a reload after the file changed on disk.
+    /// Filing such a change as an undo step is actively dangerous: Ctrl+Z would put the STALE
+    /// text back into a buffer that then reads as dirty, and the next save would overwrite the
+    /// newer file on disk with it. The history is dropped rather than kept because every revision
+    /// in it describes edits against text that no longer exists.
+    pub fn replace_from_disk(&mut self, tx: &Transaction) {
+        let _ = self.apply_inner(tx);
+        self.history = History::default();
+    }
+
     /// Try to fold this edit into the top undo revision (see coalescing policy). On success the
     /// group's stored inverse `tx` is rewritten into the current coordinate space and its `after`
     /// snapshot + timestamp advance; `before` (the group's original carets) is preserved.

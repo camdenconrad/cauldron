@@ -3880,20 +3880,13 @@ impl EditorView {
         if tx.changes.is_empty() {
             return;
         }
-        let before = self.selections.snapshot();
+        let _ = now;
         let pre = buffer.rope().clone();
         self.folds.remap(&pre, tx); // keep folds hiding the same lines after an external edit
         self.remap_snippet(tx);
-        buffer.record(
-            tx,
-            EditMeta {
-                kind: EditKind::Other,
-                carets: 1,
-                time: now,
-                before: before.clone(),
-                after: before,
-            },
-        );
+        // NOT an undo step. Undoing a reload would put the stale text back in a buffer that then
+        // reads as dirty, and the next save would overwrite the newer file on disk with it.
+        buffer.replace_from_disk(tx);
         if let Some(syn) = &mut self.syntax {
             syn.edited(buffer.rope(), &tx.changes);
         }
@@ -4913,6 +4906,24 @@ mod tests {
     fn sel_text(v: &EditorView, b: &Buffer) -> String {
         let r = v.selections.primary().range();
         b.rope().byte_slice(r).into()
+    }
+
+    #[test]
+    fn an_external_reload_is_not_undoable() {
+        // Ctrl+Z after a reload would put the STALE text back into a buffer that then reads as
+        // dirty, and the next save would overwrite the newer file on disk with it.
+        let (mut v, mut b) = setup("old contents\n");
+        v.insert(&mut b, "x", EditKind::InsertText, 0.0); // some real history to discard
+        let pre_len = b.rope().len_bytes();
+        let tx = Transaction::replace(0, pre_len, "new contents from disk\n");
+        v.apply_external(&mut b, &tx, 1.0);
+        assert_eq!(b.rope().to_string(), "new contents from disk\n");
+        v.undo(&mut b);
+        assert_eq!(
+            b.rope().to_string(),
+            "new contents from disk\n",
+            "undo must not resurrect pre-reload text"
+        );
     }
 
     #[test]

@@ -678,6 +678,13 @@ struct App {
     ws_refresh_pending: bool,
     /// An fs event arrived — check open, non-dirty buffers for on-disk changes and reload them.
     watcher_fired: bool,
+    /// Open files whose on-disk copy changed while the buffer had unsaved edits, awaiting the
+    /// user's answer. Only they can decide which side wins.
+    disk_conflicts: Vec<(PathBuf, u64)>,
+    /// Files the user answered "Keep mine" for, paired with a hash of the DISK content they were
+    /// shown. Keyed on the content, not the path: dismissing one conflict must not silence the
+    /// file forever, so a further change on disk is a new conflict and asks again.
+    disk_conflict_keep: Vec<(PathBuf, u64)>,
     /// A full SymbolIndex rebuild is wanted (open / project switch / watcher burst) — drained
     /// in update() once no build stream is inflight.
     symbols_rebuild_pending: bool,
@@ -779,6 +786,10 @@ struct App {
     git_panel: GitPanel,
     /// Ctrl+G goto-line overlay: Some(buffer text) while open.
     goto_line: Option<String>,
+    /// Quick Definition (Ctrl+Shift+I): `(file, 0-based line, the lines to show)`.
+    peek: Option<(PathBuf, usize, String)>,
+    /// The next `textDocument/definition` answer belongs to the peek popup, not to navigation.
+    peek_pending: bool,
     /// Where the most recent buffer change landed — the Ctrl+Shift+Backspace target. Survives
     /// navigating away, which is the entire point: it is how you get back to what you were
     /// writing after chasing a definition across the tree.
@@ -1018,6 +1029,8 @@ impl App {
             psi_closed_files: Vec::new(),
             watcher: None,
             watcher_fired: false,
+            disk_conflicts: Vec::new(),
+            disk_conflict_keep: Vec::new(),
             ws_refresh_pending: false,
             // Build-on-open (replaces the old rebuild-only-when-empty kick).
             symbols_rebuild_pending: true,
@@ -1063,6 +1076,8 @@ impl App {
             fix_request_refactor: false,
             git_panel: GitPanel::default(),
             goto_line: None,
+            peek: None,
+            peek_pending: false,
             last_edit: None,
             rename: None,
             usages: Vec::new(),
@@ -1350,6 +1365,14 @@ impl App {
         let was_c = matches!(g.files[i].lang, Some(Lang::C) | Some(Lang::Cpp));
         let was_loaded = g.files[i].loaded;
         g.files.remove(i);
+        // A closed file has no buffer to conflict with; a pending prompt about it would be
+        // asking the user to choose between two things that no longer both exist.
+        let still_open = self.groups.iter().flat_map(|g| g.files.iter()).any(|f| f.path == path);
+        if !still_open {
+            self.disk_conflicts.retain(|(q, _)| q != &path);
+            self.disk_conflict_keep.retain(|(q, _)| q != &path);
+        }
+        let Some(g) = self.groups.get_mut(gi) else { return };
         // Removing a tab LEFT of the active one shifts every later index down — without this
         // decrement the pane silently switched to the next file over (and Ctrl+W/save then
         // targeted a tab the user never picked).
@@ -1627,6 +1650,7 @@ impl App {
 
     fn save(&mut self) {
         let mut ok = false;
+        let mut saved_path: Option<PathBuf> = None;
         if let Some(f) = self.groups[self.focused].active_file() {
             if !f.loaded {
                 return; // lazy stub: writing its empty buffer would TRUNCATE the real file
@@ -1636,6 +1660,7 @@ impl App {
                 Ok(()) => {
                     localhist::record(&f.path, &text);
                     f.dirty = false;
+                    saved_path = Some(f.path.clone());
                     let is_c = matches!(f.lang, Some(Lang::C) | Some(Lang::Cpp));
                     let p = f.path.clone();
                     self.lsp.did_save(&p);
@@ -1653,6 +1678,11 @@ impl App {
                 }
                 Err(e) => self.error = Some(format!("save failed: {e}")),
             }
+        }
+        if let Some(p) = saved_path {
+            // Buffer and disk have converged, so any conflict about this file is resolved.
+            self.disk_conflicts.retain(|(q, _)| q != &p);
+            self.disk_conflict_keep.retain(|(q, _)| q != &p);
         }
         if ok {
             self.ws_refresh_pending = true; // async re-walk, drained in update()
@@ -1692,6 +1722,8 @@ impl App {
             match safewrite::write(&path, &text) {
                 Ok(()) => {
                     localhist::record(&path, &text);
+                    self.disk_conflicts.retain(|(q, _)| q != &path);
+                    self.disk_conflict_keep.retain(|(q, _)| q != &path);
                     self.lsp.did_save(&path);
                     if let Some(f) = self.find_file_mut(&path) {
                         f.dirty = false;
@@ -1715,6 +1747,7 @@ impl App {
         // Phase 1: mutate the buffers, collecting what LSP/UI need refreshed afterwards.
         let mut synced: Vec<(PathBuf, Vec<(Rope, cauldron_editor::Transaction)>, Rope)> = Vec::new();
         let mut conflicts = 0usize;
+        let mut conflict_paths: Vec<(PathBuf, u64)> = Vec::new();
         for g in &mut self.groups {
             for f in &mut g.files {
                 if !f.loaded {
@@ -1725,7 +1758,19 @@ impl App {
                     continue; // unchanged (includes our own just-written saves)
                 }
                 if f.dirty {
-                    conflicts += 1; // unsaved edits — keep them, don't reload
+                    // Unsaved edits AND a changed file on disk: only the user can say which one
+                    // wins. Silently keeping the buffer means the next save destroys whatever
+                    // landed on disk (a rebase, a formatter, a generator); silently reloading
+                    // destroys their typing. Collect it and ask.
+                    conflicts += 1;
+                    let h = hash_str(&disk);
+                    let dismissed = self
+                        .disk_conflict_keep
+                        .iter()
+                        .any(|(p, seen)| *p == f.path && *seen == h);
+                    if !dismissed && !conflict_paths.iter().any(|(p, _)| p == &f.path) {
+                        conflict_paths.push((f.path.clone(), h));
+                    }
                     continue;
                 }
                 let pre = f.buffer.rope().clone();
@@ -1760,6 +1805,90 @@ impl App {
         if conflicts > 0 {
             self.lsp_message =
                 Some(format!("{conflicts} open file(s) changed on disk — unsaved edits kept"));
+            // Don't re-raise a prompt the user already answered for these exact files; the
+            // watcher fires repeatedly and a modal that keeps coming back is worse than the
+            // conflict. `keep_mine` is cleared when the buffer is saved or closed.
+            for (p, h) in conflict_paths {
+                if !self.disk_conflicts.iter().any(|(q, _)| q == &p) {
+                    self.disk_conflicts.push((p, h));
+                }
+            }
+        }
+    }
+
+    /// The "changed on disk" resolver. Modal on purpose: continuing to type into a buffer whose
+    /// file has moved under you produces work that one side or the other is going to lose.
+    fn disk_conflict_ui(&mut self, ctx: &egui::Context) {
+        if self.disk_conflicts.is_empty() {
+            return;
+        }
+        let paths = self.disk_conflicts.clone();
+        let mut reload: Vec<PathBuf> = Vec::new();
+        let mut keep: Vec<(PathBuf, u64)> = Vec::new();
+        egui::Window::new("Changed on disk")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+            .show(ctx, |ui| {
+                ui.label(
+                    egui::RichText::new(
+                        "These files changed on disk while you had unsaved edits.",
+                    )
+                    .size(13.0),
+                );
+                ui.add_space(6.0);
+                for (p, h) in &paths {
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            egui::RichText::new(p.file_name().unwrap_or_default().to_string_lossy())
+                                .monospace()
+                                .size(12.5),
+                        );
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui
+                                .button("Keep mine")
+                                .on_hover_text(
+                                    "Keep the buffer. Saving will overwrite the file on disk.",
+                                )
+                                .clicked_by(egui::PointerButton::Primary)
+                            {
+                                keep.push((p.clone(), *h));
+                            }
+                            if ui
+                                .button("Load from disk")
+                                .on_hover_text("Discard your unsaved edits to this file.")
+                                .clicked_by(egui::PointerButton::Primary)
+                            {
+                                reload.push(p.clone());
+                            }
+                        });
+                    });
+                    ui.label(
+                        egui::RichText::new(p.to_string_lossy())
+                            .size(10.5)
+                            .color(style::colors::TEXT_FAINT()),
+                    );
+                    ui.add_space(4.0);
+                }
+            });
+        let now = ctx.input(|i| i.time);
+        for p in reload {
+            if let Ok(disk) = std::fs::read_to_string(&p) {
+                if let Some(f) = self.find_file_mut(&p) {
+                    let pre_len = f.buffer.rope().len_bytes();
+                    let tx = cauldron_editor::Transaction::replace(0, pre_len, disk);
+                    f.view.apply_external(&mut f.buffer, &tx, now);
+                    f.dirty = false;
+                }
+            }
+            self.disk_conflicts.retain(|(q, _)| q != &p);
+        }
+        for (p, h) in keep {
+            // Remembered against the exact disk content shown, so the watcher's next burst does
+            // not re-ask — but a genuinely NEW change on disk does.
+            self.disk_conflict_keep.retain(|(q, _)| q != &p);
+            self.disk_conflict_keep.push((p.clone(), h));
+            self.disk_conflicts.retain(|(q, _)| q != &p);
         }
     }
 
@@ -3586,6 +3715,7 @@ impl App {
             C::ExtractFunction => self.extract_function(ctx),
             C::CreateFunctionFromUsage => self.create_function_from_usage(ctx),
             C::GenerateDefinition => self.generate_definition(ctx),
+            C::QuickDefinition => self.quick_definition(ctx),
             C::NextProblem => self.goto_next_problem(true),
             C::PrevProblem => self.goto_next_problem(false),
             C::HighlightUsagesInFile => {
@@ -4152,6 +4282,16 @@ impl App {
                     // Trait impls / overloads often resolve to several sites — silently taking
                     // the first was wrong more often than right. One target jumps directly;
                     // more open the chooser at the caret.
+                    // Ctrl+Shift+I asked to SEE the definition, not go to it — same request,
+                    // different destination for the answer.
+                    if self.peek_pending {
+                        self.peek_pending = false;
+                        match targets.first() {
+                            Some((p, pos)) => self.open_peek(p.clone(), *pos),
+                            None => self.lsp_message = Some("no definition found".into()),
+                        }
+                        return None;
+                    }
                     if targets.len() == 1 {
                         let (path, target) = targets.remove(0);
                         self.jump_to_lsp_location(path, target);
@@ -6666,6 +6806,95 @@ impl App {
         }
     }
 
+    /// Ctrl+Shift+I: ask for the definition, but show it in a popup instead of navigating.
+    fn quick_definition(&mut self, _ctx: &egui::Context) {
+        let g = &self.groups[self.focused];
+        let Some(f) = g.files.get(g.active).filter(|f| f.loaded) else { return };
+        let (path, rope, gen, byte) =
+            (f.path.clone(), f.buffer.rope().clone(), f.buffer.generation, f.view.caret_byte());
+        self.peek_pending = true;
+        self.lsp.request_definition(&path, &rope, byte, gen);
+        self.lsp_message = Some("looking up definition…".into());
+    }
+
+    /// Load the lines around a definition into the peek popup. Reads from the OPEN BUFFER when
+    /// the target file is open — showing the saved copy of a file the user has been editing would
+    /// be a quietly wrong answer.
+    fn open_peek(&mut self, path: PathBuf, pos: lsp_types::Position) {
+        const CONTEXT: usize = 14;
+        let text = match self.find_file_mut(&path).filter(|f| f.loaded) {
+            Some(f) => f.buffer.rope().to_string(),
+            None => match std::fs::read_to_string(&path) {
+                Ok(t) => t,
+                Err(e) => {
+                    self.lsp_message = Some(format!("{}: {e}", path.display()));
+                    return;
+                }
+            },
+        };
+        let lines: Vec<&str> = text.lines().collect();
+        let at = (pos.line as usize).min(lines.len().saturating_sub(1));
+        let end = (at + CONTEXT).min(lines.len());
+        let body = lines[at..end].join("\n");
+        self.peek = Some((path, at, body));
+        self.lsp_message = None;
+    }
+
+    /// The Quick Definition popup.
+    fn peek_ui(&mut self, ctx: &egui::Context) {
+        let Some((path, line, body)) = self.peek.clone() else { return };
+        let mut close = false;
+        let mut jump = false;
+        egui::Window::new("Quick Definition")
+            .collapsible(false)
+            .resizable(true)
+            .default_width(720.0)
+            .anchor(egui::Align2::CENTER_TOP, egui::Vec2::new(0.0, 90.0))
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "{}:{}",
+                            path.file_name().unwrap_or_default().to_string_lossy(),
+                            line + 1
+                        ))
+                        .size(11.5)
+                        .color(style::colors::TEXT_MUTED()),
+                    );
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.button("✕").clicked_by(egui::PointerButton::Primary) {
+                            close = true;
+                        }
+                        if ui
+                            .button("Go to")
+                            .on_hover_text("Open the definition (Ctrl+B)")
+                            .clicked_by(egui::PointerButton::Primary)
+                        {
+                            jump = true;
+                        }
+                    });
+                });
+                style::hairline(ui);
+                egui::ScrollArea::vertical().max_height(320.0).show(ui, |ui| {
+                    ui.label(
+                        egui::RichText::new(&body)
+                            .monospace()
+                            .size(12.0)
+                            .color(style::colors::TEXT()),
+                    );
+                });
+            });
+        if jump {
+            let byte_line = line;
+            self.open_file(path.clone());
+            self.goto_line_1based(byte_line + 1);
+            close = true;
+        }
+        if close || ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            self.peek = None;
+        }
+    }
+
     /// F2 / Shift+F2: jump to the next (previous) problem in the current file, wrapping.
     ///
     /// Errors are visited before warnings: with both present, F2 walking a hundred style warnings
@@ -7765,6 +7994,10 @@ impl eframe::App for App {
         // Ctrl+F2 = stop, JetBrains' binding. Harmless when nothing is running.
         if cmd(egui::Key::F2) {
             self.stop_run();
+        }
+        // Ctrl+Shift+I = Quick Definition (peek without navigating).
+        if ctx.input(|i| i.modifiers.command && i.modifiers.shift && i.key_pressed(egui::Key::I)) {
+            self.quick_definition(ctx);
         }
         // F2 / Shift+F2 = next / previous problem. Plain F2 only: Ctrl+F2 is Stop.
         if ctx.input(|i| i.key_pressed(egui::Key::F2) && !i.modifiers.command && !shell) {
@@ -9459,6 +9692,8 @@ impl eframe::App for App {
                 self.goto_line_1based(line);
             }
         }
+        self.disk_conflict_ui(ctx);
+        self.peek_ui(ctx);
         // Command palette: draw, and run whatever action was chosen.
         if let Some(cmd) = self.palette.ui(ctx) {
             self.run_command(cmd, ctx);
@@ -11092,6 +11327,15 @@ fn counterpart_path(path: &Path) -> Option<PathBuf> {
         }
     }
     None
+}
+
+/// Stable content hash for conflict bookkeeping. Only equality matters, never persistence, so
+/// the standard hasher is fine.
+fn hash_str(s: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    s.hash(&mut h);
+    h.finish()
 }
 
 /// The identifier span touching `byte`, or an empty range when the caret is not on a word.
