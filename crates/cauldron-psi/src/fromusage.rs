@@ -292,6 +292,140 @@ fn line_start(src: &str, byte: usize) -> usize {
     src[..byte].rfind('\n').map_or(0, |i| i + 1)
 }
 
+/// Generate a DEFINITION for the prototype at `offset`.
+///
+/// The complement of [`plan`]: there the call exists and the function does not, here the
+/// declaration exists and the body does not. This is the single most mechanical piece of typing in
+/// C — copying a prototype from a header into a `.c` and turning `;` into `{ }` — and getting the
+/// parameter names to match by hand is where it goes wrong.
+///
+/// Returns `None` when the prototype cannot be read, or when a definition already exists (`known`
+/// is wired to the index, so re-generating over a real definition is impossible).
+pub fn definition_for_declaration(
+    src: &str,
+    offset: usize,
+    known: &dyn Fn(&str) -> bool,
+) -> Option<StubPlan> {
+    let mut parser = tree_sitter::Parser::new();
+    parser.set_language(&tree_sitter_c::language()).ok()?;
+    let tree = parser.parse(src, None)?;
+    let root = tree.root_node();
+
+    // A prototype is a `declaration` whose declarator is a function_declarator.
+    let decl = enclosing(root, offset, "declaration")?;
+    if decl.has_error() {
+        return None;
+    }
+    let mut cur = decl.walk();
+    let top = decl
+        .children_by_field_name("declarator", &mut cur)
+        .find(|d| unwrap_to_function(*d).is_some())?;
+    let fd = unwrap_to_function(top)?;
+    let name_node = fd.child_by_field_name("declarator").and_then(|d| innermost_identifier(d))?;
+    let name = src[name_node.byte_range()].to_string();
+    if known(&name) {
+        return None;
+    }
+    let ret = decl.child_by_field_name("type").map(|t| text_of(t, src))?;
+    let params = fd.child_by_field_name("parameters").map(|p| text_of(p, src))?;
+    // Storage class travels with the DEFINITION too: a `static` prototype whose definition is
+    // non-static is a different symbol, and the compiler will say so.
+    let is_static = (0..decl.named_child_count())
+        .filter_map(|i| decl.named_child(i))
+        .any(|c| c.kind() == "storage_class_specifier" && &src[c.byte_range()] == "static");
+    // `char *dup(...)` nests pointer_declarator ABOVE function_declarator, so the stars are on
+    // the path DOWN to it — looking below the function declarator finds nothing.
+    let stars = pointer_stars_above(top);
+
+    let mut text = String::new();
+    if is_static {
+        text.push_str("static ");
+    }
+    text.push_str(&format!("{ret}{stars} "));
+    let name_start = text.len();
+    text.push_str(&name);
+    text.push_str(&format!("{params}\n{{\n"));
+    let ph_start = text.len();
+    let void_ret = ret == "void" && stars.is_empty();
+    let placeholder = "    /* TODO */";
+    text.push_str(placeholder);
+    if !void_ret {
+        text.push_str("\n    return 0;");
+    }
+    text.push_str("\n}\n\n");
+    let _ = name_start;
+
+    Some(StubPlan {
+        name,
+        // At the END of the file: a definition placed above other code would sit between a header
+        // block and the code that follows it, and there is no "right" neighbour to guess.
+        insert_at: src.len(),
+        text,
+        body_placeholder: ph_start..ph_start + placeholder.len(),
+        guessed_types: false,
+    })
+}
+
+/// The `function_declarator` a prototype's declarator bottoms out in, if it is one.
+fn unwrap_to_function(d: Node) -> Option<Node> {
+    let mut cur = d;
+    loop {
+        match cur.kind() {
+            "function_declarator" => return Some(cur),
+            "pointer_declarator" | "parenthesized_declarator" | "attributed_declarator" => {
+                cur = match cur.kind() {
+                    "parenthesized_declarator" => cur.named_child(0)?,
+                    _ => cur.child_by_field_name("declarator")?,
+                };
+            }
+            _ => return None,
+        }
+    }
+}
+
+fn innermost_identifier(d: Node) -> Option<Node> {
+    let mut cur = d;
+    loop {
+        match cur.kind() {
+            "identifier" => return Some(cur),
+            "parenthesized_declarator" => cur = cur.named_child(0)?,
+            _ => cur = cur.child_by_field_name("declarator")?,
+        }
+    }
+}
+
+/// The stars between the return type and the name (`char *strdup(...)` -> ` *`), counted from the
+/// declaration's own declarator down to the function declarator.
+fn pointer_stars_above(top: Node) -> String {
+    let mut stars = String::new();
+    let mut cur = top;
+    loop {
+        match cur.kind() {
+            "function_declarator" => break,
+            "pointer_declarator" => {
+                stars.push('*');
+                match cur.child_by_field_name("declarator") {
+                    Some(n) => cur = n,
+                    None => break,
+                }
+            }
+            "parenthesized_declarator" => match cur.named_child(0) {
+                Some(n) => cur = n,
+                None => break,
+            },
+            "attributed_declarator" => match cur.child_by_field_name("declarator") {
+                Some(n) => cur = n,
+                None => break,
+            },
+            _ => break,
+        }
+    }
+    match stars.is_empty() {
+        true => String::new(),
+        false => format!(" {stars}"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -357,6 +491,54 @@ mod tests {
         let p = plan(src, at(src, "handle"), &none).unwrap();
         assert!(p.guessed_types, "an unknown call's type cannot be known");
         assert!(p.text.contains("TODO: check the generated parameter types"), "{}", p.text);
+    }
+
+    // --- generate definition from declaration -------------------------------------------------
+
+    #[test]
+    fn generates_a_definition_matching_the_prototype() {
+        let src = "int add(int a, int b);\n";
+        let p = definition_for_declaration(src, at(src, "add"), &none).unwrap();
+        assert!(p.text.starts_with("int add(int a, int b)\n{\n"), "{}", p.text);
+        assert!(p.text.contains("return 0;"), "a non-void definition needs a return: {}", p.text);
+        assert_eq!(p.insert_at, src.len(), "appended, not wedged between existing code");
+    }
+
+    #[test]
+    fn a_void_prototype_gets_no_return() {
+        let src = "void reset(void);\n";
+        let p = definition_for_declaration(src, at(src, "reset"), &none).unwrap();
+        assert!(!p.text.contains("return"), "{}", p.text);
+        assert!(p.text.contains("void reset(void)"), "{}", p.text);
+    }
+
+    #[test]
+    fn static_travels_to_the_definition() {
+        // A static prototype whose definition is non-static is a DIFFERENT symbol, and the
+        // compiler says so.
+        let src = "static int helper(int n);\n";
+        let p = definition_for_declaration(src, at(src, "helper"), &none).unwrap();
+        assert!(p.text.starts_with("static int helper(int n)"), "{}", p.text);
+    }
+
+    #[test]
+    fn a_pointer_return_keeps_its_stars() {
+        let src = "char *dup_name(const char *s);\n";
+        let p = definition_for_declaration(src, at(src, "dup_name"), &none).unwrap();
+        assert!(p.text.starts_with("char * dup_name(const char *s)"), "{}", p.text);
+    }
+
+    #[test]
+    fn declines_when_a_definition_already_exists() {
+        let src = "int add(int a, int b);\n";
+        assert!(definition_for_declaration(src, at(src, "add"), &|n| n == "add").is_none());
+    }
+
+    #[test]
+    fn declines_on_a_variable_declaration() {
+        // `int x;` is not a prototype and must not become a function.
+        let src = "int x;\n";
+        assert!(definition_for_declaration(src, at(src, "x"), &none).is_none());
     }
 
     // --- regressions found by adversarial review ---------------------------------------------

@@ -758,6 +758,13 @@ struct App {
     /// Cached [`App::create_fn_available`] for the open fix menu (see its docs — it parses the
     /// whole buffer, and the menu repaints every frame).
     fix_menu_create_fn: bool,
+    /// Keyboard-selected row of the open fix menu. Reset when the menu opens — landing on
+    /// whatever index the last menu happened to end on is disorienting, and on a shorter menu it
+    /// would point somewhere the user never looked.
+    fix_menu_sel: usize,
+    /// Cached availability of Generate Definition for the open menu (same per-frame parse cost
+    /// argument as [`App::fix_menu_create_fn`]).
+    fix_menu_gen_def: bool,
     /// The Change Signature dialog (Ctrl+F6), when open.
     chsig: Option<chsig_ui::ChangeSigUi>,
     /// Generation of the in-flight rust-analyzer references request backing the dialog. Kept
@@ -1048,6 +1055,8 @@ impl App {
             fix_menu: None,
             fix_menu_title: "Quick Fixes",
             fix_menu_create_fn: false,
+            fix_menu_sel: 0,
+            fix_menu_gen_def: false,
             chsig: None,
             chsig_refs_gen: None,
             chsig_req_seq: 0,
@@ -3576,6 +3585,9 @@ impl App {
             C::ExtractVariable => self.extract_variable(ctx),
             C::ExtractFunction => self.extract_function(ctx),
             C::CreateFunctionFromUsage => self.create_function_from_usage(ctx),
+            C::GenerateDefinition => self.generate_definition(ctx),
+            C::NextProblem => self.goto_next_problem(true),
+            C::PrevProblem => self.goto_next_problem(false),
             C::HighlightUsagesInFile => {
                 let g = &mut self.groups[self.focused];
                 let a = g.active;
@@ -3814,6 +3826,8 @@ impl App {
                             .or_else(ctx_pointer_pos)
                             .unwrap_or(egui::pos2(200.0, 200.0));
                         self.fix_menu_create_fn = !refactor && self.create_fn_available();
+                        self.fix_menu_gen_def = self.generate_definition_available();
+                        self.fix_menu_sel = 0;
                         self.fix_menu = Some((anchor, path, sort_actions_by_kind(actions)));
                     }
                 }
@@ -6426,6 +6440,83 @@ impl App {
     }
 
     /// Ctrl+G: open the go-to-line prompt as the only overlay.
+    /// Alt+Enter on a prototype: write its definition.
+    ///
+    /// The definition lands in the COUNTERPART source file when the caret is in a header — that
+    /// is where it belongs, and generating it into the header would produce a multiply-defined
+    /// symbol the moment two translation units include it. Falls back to the current file when
+    /// there is no counterpart.
+    fn generate_definition(&mut self, ctx: &egui::Context) {
+        let now = ctx.input(|i| i.time);
+        let g = &self.groups[self.focused];
+        let Some(f) = g.files.get(g.active).filter(|f| f.loaded) else { return };
+        if !matches!(f.lang, Some(Lang::C)) {
+            return;
+        }
+        let here = f.path.clone();
+        let src = f.buffer.rope().to_string();
+        let offset = f.view.primary_selection_range().start;
+        let Some(psi) = self.psi.index() else {
+            self.lsp_message = Some("C index not ready".into());
+            return;
+        };
+        // Only a DEFINITION blocks generation; the prototype under the caret is itself a
+        // declaration, so counting declarations here would always refuse.
+        let known = |n: &str| !psi.defs_by_name(n).is_empty();
+        let Some(plan) = cauldron_psi::fromusage::definition_for_declaration(&src, offset, &known)
+        else {
+            self.lsp_message = Some("put the caret on a prototype with no definition".into());
+            return;
+        };
+        let is_header = here.extension().and_then(|e| e.to_str()) == Some("h");
+        let target = match is_header {
+            true => counterpart_path(&here).unwrap_or_else(|| here.clone()),
+            false => here.clone(),
+        };
+        // The insertion offset was computed against THIS buffer; in another file it means
+        // "append", which is what definition_for_declaration asks for anyway.
+        let at = match target == here {
+            true => plan.insert_at,
+            false => self
+                .find_file_mut(&target)
+                .map(|f| f.buffer.rope().len_bytes())
+                .or_else(|| std::fs::metadata(&target).ok().map(|m| m.len() as usize))
+                .unwrap_or(0),
+        };
+        let edits = vec![cauldron_psi::chsig::Edit { range: at..at, text: plan.text.clone() }];
+        match self.apply_psi_edits(&target, &edits, now) {
+            Ok(()) => {
+                if target != here {
+                    self.open_file(target.clone());
+                }
+                self.lsp_message = Some(format!(
+                    "defined `{}` in {}",
+                    plan.name,
+                    target.file_name().unwrap_or_default().to_string_lossy()
+                ));
+            }
+            Err(e) => self.lsp_message = Some(e),
+        }
+    }
+
+    /// Is the caret on a prototype whose definition does not exist yet?
+    fn generate_definition_available(&self) -> bool {
+        let g = &self.groups[self.focused];
+        let Some(f) = g.files.get(g.active).filter(|f| f.loaded) else { return false };
+        if !matches!(f.lang, Some(Lang::C)) {
+            return false;
+        }
+        let Some(psi) = self.psi.index() else { return false };
+        let known = |n: &str| !psi.defs_by_name(n).is_empty();
+        let src = f.buffer.rope().to_string();
+        cauldron_psi::fromusage::definition_for_declaration(
+            &src,
+            f.view.primary_selection_range().start,
+            &known,
+        )
+        .is_some()
+    }
+
     /// Is the caret on a call this project has no definition or prototype for?
     ///
     /// Computed ONCE when the menu opens and cached in `fix_menu_create_fn`. It parses the whole
@@ -6571,6 +6662,46 @@ impl App {
             None => {
                 self.lsp_message =
                     Some("select a single-line expression to extract".into())
+            }
+        }
+    }
+
+    /// F2 / Shift+F2: jump to the next (previous) problem in the current file, wrapping.
+    ///
+    /// Errors are visited before warnings: with both present, F2 walking a hundred style warnings
+    /// before reaching the error that actually breaks the build is the behaviour that makes people
+    /// stop pressing it. Only when there are no errors does it walk the lesser severities.
+    fn goto_next_problem(&mut self, forward: bool) {
+        let g = &self.groups[self.focused];
+        let Some(f) = g.files.get(g.active) else { return };
+        let path = f.path.clone();
+        let caret = f.view.primary_selection_range().start;
+        let all = self.diags.merged(&path);
+        if all.is_empty() {
+            self.lsp_message = Some("no problems in this file".into());
+            return;
+        }
+        // Severity 1 is error; anything above is a warning or weaker.
+        let errors: Vec<_> = all.iter().filter(|d| d.severity == 1).cloned().collect();
+        let pool = if errors.is_empty() { all } else { errors };
+        let target = match forward {
+            true => pool
+                .iter()
+                .find(|d| d.range.start > caret)
+                .or_else(|| pool.first())
+                .map(|d| d.range.start),
+            false => pool
+                .iter()
+                .rev()
+                .find(|d| d.range.start < caret)
+                .or_else(|| pool.last())
+                .map(|d| d.range.start),
+        };
+        if let Some(byte) = target {
+            self.navigate_to(path, byte);
+            // Show WHAT the problem is, not just where — otherwise the jump is a guessing game.
+            if let Some(d) = pool.iter().find(|d| d.range.start == byte) {
+                self.lsp_message = Some(d.message.clone());
             }
         }
     }
@@ -6776,8 +6907,10 @@ impl App {
         // (suppress_enter) — only stolen once the user has navigated the list.
         let open = self.completion.is_some() || self.def_choices.is_some();
         // The recent-locations popup ALSO owns Enter (it jumps on Enter), unlike the
-        // completion/def popups where Enter stays a newline — so it suppresses both.
-        let recent_open = self.recent_locations.is_some();
+        // completion/def popups where Enter stays a newline — so it suppresses both. The
+        // Alt+Enter fix menu is the same shape: its arrows move the selection and its Enter
+        // invokes, so the editor must not also move the caret or insert a line.
+        let recent_open = self.recent_locations.is_some() || self.fix_menu.is_some();
         if let Some(f) = self.groups[self.focused].active_file() {
             f.view.suppress_nav_keys = open || recent_open;
             if recent_open {
@@ -7632,6 +7765,11 @@ impl eframe::App for App {
         // Ctrl+F2 = stop, JetBrains' binding. Harmless when nothing is running.
         if cmd(egui::Key::F2) {
             self.stop_run();
+        }
+        // F2 / Shift+F2 = next / previous problem. Plain F2 only: Ctrl+F2 is Stop.
+        if ctx.input(|i| i.key_pressed(egui::Key::F2) && !i.modifiers.command && !shell) {
+            let back = ctx.input(|i| i.modifiers.shift);
+            self.goto_next_problem(!back);
         }
         // Ctrl+Shift+Backspace = jump to the last edit; Alt+F1 = reveal in the project tree.
         if ctx.input(|i| i.modifiers.command && i.modifiers.shift && i.key_pressed(egui::Key::Backspace))
@@ -9023,129 +9161,141 @@ impl eframe::App for App {
             }
         }
         if let Some((pos, path, actions)) = self.fix_menu.clone() {
-            let mut close_menu = false;
-            let mut extract_var = false;
-            let mut extract_fn = false;
-            let mut create_fn = false;
+            // The menu is built as a FLAT row list first, then rendered. Keyboard navigation
+            // needs one index across our synthetic entries and the server's actions alike, and
+            // interleaving selection state with the old inline `if` chain made that impossible.
+            #[derive(Clone)]
+            enum Row {
+                Rename,
+                ExtractVar,
+                ExtractFn,
+                ChangeSig,
+                CreateFn,
+                GenerateDef,
+                Action(usize),
+            }
+            let mut rows: Vec<(Row, String)> = Vec::new();
+            if self.fix_menu_title == "Refactor This" {
+                // Rename has a dedicated inline editor and its own shortcut, so it never appears
+                // among code actions — but its absence from a Refactor menu would be conspicuous.
+                rows.push((Row::Rename, "Rename…                Shift+F6".into()));
+                // Extract Variable is ours and purely textual, so it works with no language
+                // server at all — which is when it is most wanted.
+                rows.push((Row::ExtractVar, "Extract Variable…      Ctrl+Alt+V".into()));
+                if self.extract_function_available() {
+                    rows.push((Row::ExtractFn, "Extract Function…      Ctrl+Alt+M".into()));
+                }
+                if self.change_signature_available() {
+                    rows.push((Row::ChangeSig, "Change Signature…      Ctrl+F6".into()));
+                }
+            }
+            // Create-from-usage belongs in QUICK FIXES: it answers an error on the line, which is
+            // exactly what Alt+Enter is for.
+            if self.fix_menu_title == "Quick Fixes" && self.fix_menu_create_fn {
+                rows.push((Row::CreateFn, "Create function from usage".into()));
+            }
+            if self.fix_menu_gen_def {
+                rows.push((Row::GenerateDef, "Generate definition".into()));
+            }
+            let synthetic = rows.len();
+            for (i, action) in actions.iter().enumerate() {
+                let (title, preferred) = match action {
+                    lsp_types::CodeActionOrCommand::Command(c) => (c.title.clone(), false),
+                    lsp_types::CodeActionOrCommand::CodeAction(a) => {
+                        (a.title.clone(), a.is_preferred.unwrap_or(false))
+                    }
+                };
+                rows.push((
+                    Row::Action(i),
+                    if preferred { format!("★ {title}") } else { title },
+                ));
+            }
+            if rows.is_empty() {
+                self.fix_menu = None;
+                return;
+            }
+            // Arrows move, wrapping at both ends; Enter invokes. Read BEFORE drawing so the
+            // highlight and the activation agree within one frame.
+            let (up, down, enter) = ctx.input(|i| {
+                (
+                    i.key_pressed(egui::Key::ArrowUp),
+                    i.key_pressed(egui::Key::ArrowDown),
+                    i.key_pressed(egui::Key::Enter),
+                )
+            });
+            if down {
+                self.fix_menu_sel = (self.fix_menu_sel + 1) % rows.len();
+            }
+            if up {
+                self.fix_menu_sel = (self.fix_menu_sel + rows.len() - 1) % rows.len();
+            }
+            self.fix_menu_sel = self.fix_menu_sel.min(rows.len() - 1);
+
+            let mut chosen: Option<Row> = None;
+            if enter {
+                chosen = Some(rows[self.fix_menu_sel].0.clone());
+            }
+            let sel = self.fix_menu_sel;
+            let title = self.fix_menu_title;
             egui::Area::new("quickfixes".into())
                 .fixed_pos(pos)
                 .order(egui::Order::Foreground)
                 .show(ctx, |ui| {
                     egui::Frame::popup(ui.style()).show(ui, |ui| {
                         ui.set_min_width(260.0);
-                        style::panel_header_inline(ui, self.fix_menu_title);
-                        // Rename is ours, not the server's — it has a dedicated inline editor and
-                        // its own shortcut, so it never shows up among code actions. In a
-                        // Refactor This menu its absence would be conspicuous.
-                        if self.fix_menu_title == "Refactor This" {
-                            if ui
-                                .selectable_label(
-                                    false,
-                                    egui::RichText::new("Rename…                Shift+F6").size(12.5),
-                                )
-                                .clicked_by(egui::PointerButton::Primary)
-                            {
-                                self.start_rename();
-                                close_menu = true;
-                            }
-                            // Extract Variable is ours too — purely textual, so it works with no
-                            // language server at all, which is when it is most wanted.
-                            if ui
-                                .selectable_label(
-                                    false,
-                                    egui::RichText::new("Extract Variable…      Ctrl+Alt+V")
-                                        .size(12.5),
-                                )
-                                .clicked_by(egui::PointerButton::Primary)
-                            {
-                                extract_var = true;
-                                close_menu = true;
-                            }
-                            if self.extract_function_available()
-                                && ui
-                                    .selectable_label(
-                                        false,
-                                        egui::RichText::new("Extract Function…      Ctrl+Alt+M")
-                                            .size(12.5),
-                                    )
-                                    .clicked_by(egui::PointerButton::Primary)
-                            {
-                                extract_fn = true;
-                                close_menu = true;
-                            }
-                            // Change Signature is ours (PSI-driven) — no C language server
-                            // implements it, so it never appears among the server's actions.
-                            if self.change_signature_available()
-                                && ui
-                                    .selectable_label(
-                                        false,
-                                        egui::RichText::new("Change Signature…      Ctrl+F6")
-                                            .size(12.5),
-                                    )
-                                    .clicked_by(egui::PointerButton::Primary)
-                            {
-                                self.start_change_signature();
-                                close_menu = true;
-                            }
-                            ui.separator();
-                        }
-                        // Create-from-usage belongs in QUICK FIXES, not Refactor This: it is the
-                        // answer to an error on the line, which is exactly what Alt+Enter is for.
-                        if self.fix_menu_title == "Quick Fixes" && self.fix_menu_create_fn {
-                            if ui
-                                .selectable_label(
-                                    false,
-                                    egui::RichText::new("Create function from usage").size(12.5),
-                                )
-                                .clicked_by(egui::PointerButton::Primary)
-                            {
-                                create_fn = true;
-                                close_menu = true;
-                            }
-                            ui.separator();
-                        }
+                        style::panel_header_inline(ui, title);
                         let mut group_shown = "";
-                        for (i, action) in actions.iter().enumerate() {
-                            let group = action_group(action);
-                            if group != group_shown {
-                                if !group_shown.is_empty() {
-                                    ui.add_space(2.0);
+                        for (idx, (row, label)) in rows.iter().enumerate() {
+                            // Group headings apply to the server's actions only; ours are the
+                            // menu's own commands and sit above the first heading.
+                            if let Row::Action(i) = row {
+                                let group = action_group(&actions[*i]);
+                                if group != group_shown {
+                                    if idx > 0 {
+                                        ui.add_space(2.0);
+                                    }
+                                    group_shown = group;
+                                    ui.label(
+                                        egui::RichText::new(group)
+                                            .size(10.5)
+                                            .color(style::colors::TEXT_MUTED()),
+                                    );
                                 }
-                                group_shown = group;
-                                ui.label(
-                                    egui::RichText::new(group)
-                                        .size(10.5)
-                                        .color(style::colors::TEXT_MUTED()),
-                                );
+                            } else if idx == synthetic.saturating_sub(1) && synthetic > 0 {
+                                // separator drawn after the last synthetic row, below
                             }
-                            let (title, preferred) = match action {
-                                lsp_types::CodeActionOrCommand::Command(c) => (c.title.clone(), false),
-                                lsp_types::CodeActionOrCommand::CodeAction(a) => {
-                                    (a.title.clone(), a.is_preferred.unwrap_or(false))
-                                }
-                            };
-                            let label = if preferred { format!("★ {title}") } else { title };
-                            if ui
-                                .selectable_label(false, egui::RichText::new(label).size(12.5))
-                                .clicked_by(egui::PointerButton::Primary)
-                            {
-                                let now = ctx.input(|inp| inp.time);
-                                self.apply_code_action(&path, &actions[i].clone(), now);
-                                close_menu = true;
+                            let resp = ui.selectable_label(
+                                idx == sel,
+                                egui::RichText::new(label).size(12.5),
+                            );
+                            if idx == sel {
+                                resp.scroll_to_me(None);
+                            }
+                            if resp.clicked_by(egui::PointerButton::Primary) {
+                                chosen = Some(row.clone());
+                            }
+                            if idx + 1 == synthetic && synthetic < rows.len() {
+                                ui.separator();
                             }
                         }
                     });
                 });
-            if extract_var {
-                self.extract_variable(ctx);
+            if let Some(row) = chosen {
+                match row {
+                    Row::Rename => self.start_rename(),
+                    Row::ExtractVar => self.extract_variable(ctx),
+                    Row::ExtractFn => self.extract_function(ctx),
+                    Row::ChangeSig => self.start_change_signature(),
+                    Row::CreateFn => self.create_function_from_usage(ctx),
+                    Row::GenerateDef => self.generate_definition(ctx),
+                    Row::Action(i) => {
+                        let now = ctx.input(|inp| inp.time);
+                        self.apply_code_action(&path, &actions[i].clone(), now);
+                    }
+                }
+                self.fix_menu = None;
             }
-            if extract_fn {
-                self.extract_function(ctx);
-            }
-            if create_fn {
-                self.create_function_from_usage(ctx);
-            }
-            if close_menu || ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
                 self.fix_menu = None;
             }
         }
