@@ -65,6 +65,31 @@ impl Lang {
         }
     }
 
+    /// Does this language use braces to delimit blocks? Drives auto-indent: a language that
+    /// indents by other means (Python, YAML) must never have brace rules applied to it.
+    pub fn brace_indented(self) -> bool {
+        matches!(
+            self,
+            Lang::C
+                | Lang::Cpp
+                | Lang::Rust
+                | Lang::Js
+                | Lang::Ts
+                | Lang::Tsx
+                | Lang::CSharp
+                | Lang::Java
+                | Lang::Css
+                | Lang::Json
+        )
+    }
+
+    /// Is `'` a STRING delimiter here, or a character/lifetime marker? Getting this backwards
+    /// corrupts any line scan: in JS `'{'` is a string, while in Rust `'a` is a lifetime that
+    /// never closes and in C `'{'` is a one-character literal.
+    pub fn single_quote_is_string(self) -> bool {
+        matches!(self, Lang::Js | Lang::Ts | Lang::Tsx | Lang::Python | Lang::Css | Lang::Yaml)
+    }
+
     /// The block-comment delimiters `(open, close)`, if any. Drives Ctrl+Shift+/ and the Ctrl+/
     /// fallback for languages with no line comment.
     pub fn block_comment(self) -> Option<(&'static str, &'static str)> {

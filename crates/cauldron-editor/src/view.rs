@@ -2025,11 +2025,37 @@ impl EditorView {
         now: f64,
         f: impl Fn(&Selection, &Rope) -> (Range<usize>, String),
     ) {
+        // Caret lands at the end of the inserted text — the universal case.
+        self.apply_edits_caret(buffer, kind, now, |sel, rope| {
+            let (r, t) = f(sel, rope);
+            let n = t.len();
+            (r, t, n)
+        });
+    }
+
+    /// As [`Self::apply_edits`], but `f` also returns where the caret should land WITHIN the
+    /// inserted text. Needed by the brace split, which inserts two lines and must leave the caret
+    /// on the first — every other edit wants the end, which `apply_edits` supplies.
+    fn apply_edits_caret(
+        &mut self,
+        buffer: &mut Buffer,
+        kind: EditKind,
+        now: f64,
+        f: impl Fn(&Selection, &Rope) -> (Range<usize>, String, usize),
+    ) {
         let before = self.selections.snapshot();
-        let items: Vec<(Range<usize>, String)> =
+        let raw: Vec<(Range<usize>, String, usize)> =
             self.selections.ranges.iter().map(|s| f(s, buffer.rope())).collect();
+        // Carry the caret offset alongside each item through the sort/coalesce below.
+        let items: Vec<(Range<usize>, String)> =
+            raw.iter().map(|(r, t, _)| (r.clone(), t.clone())).collect();
+        let mut caret_at: Vec<usize> = raw.iter().map(|(_, _, c)| *c).collect();
+        let mut order: Vec<usize> = (0..items.len()).collect();
+        order.sort_by_key(|&i| items[i].0.start);
+        caret_at = order.iter().map(|&i| caret_at[i]).collect();
+        let items: Vec<(Range<usize>, String)> = order.into_iter().map(|i| items[i].clone()).collect();
         let mut items = items;
-        items.sort_by_key(|(r, _)| r.start);
+        // (already sorted above, alongside caret_at)
         // Coalesce OVERLAPPING ranges so the Transaction's changes stay sorted+disjoint (its hard
         // invariant). Per-caret motion can overlap: two bare carets inside one word both Ctrl+
         // Backspace to the word start, yielding e.g. 6..8 and 6..10 — which panicked apply_inner.
@@ -2067,8 +2093,12 @@ impl EditorView {
         let mut delta: isize = 0;
         let ranges: Vec<Selection> = items
             .iter()
-            .map(|(r, t)| {
-                let caret = (r.start as isize + delta + t.len() as isize) as usize;
+            .enumerate()
+            .map(|(i, (r, t))| {
+                // Coalescing can merge items; a merged entry keeps the FIRST one's caret offset,
+                // clamped so it can never point past the (now longer) text.
+                let within = caret_at.get(i).copied().unwrap_or(t.len()).min(t.len());
+                let caret = (r.start as isize + delta + within as isize) as usize;
                 delta += t.len() as isize - (r.end - r.start) as isize;
                 Selection::at(caret)
             })
@@ -2116,10 +2146,49 @@ impl EditorView {
         }
     }
 
+    /// Enter. Copies the current indent, and for brace languages adds three things a bare copy
+    /// cannot do: a trailing `{` steps in one level; splitting `{|}` opens a body and leaves the
+    /// closer on its own dedented line; and Enter inside a `/* … */` continues the comment.
+    ///
+    /// Every rule is computed from the text BEFORE the caret on the caret's own line, with
+    /// strings and comments stripped ([`code_of_line`]) so a brace inside `"{"` never counts.
     fn insert_newline(&mut self, buffer: &mut Buffer, now: f64) {
-        self.apply_edits(buffer, EditKind::Newline, now, |sel, rope| {
-            let indent = leading_ws(rope, sel.range().start);
-            (sel.range(), format!("\n{indent}"))
+        let lang = self.lang;
+        self.apply_edits_caret(buffer, EditKind::Newline, now, move |sel, rope| {
+            let start = sel.range().start;
+            let indent = leading_ws(rope, start);
+            let line_ix = rope.byte_to_line(start);
+            let line_start = rope.line_to_byte(line_ix);
+            // Only what precedes the caret decides the indent: pressing Enter in the middle of
+            // `foo() { bar` must not be swayed by text that is about to move to the next line.
+            let before: String =
+                rope.slice(rope.byte_to_char(line_start)..rope.byte_to_char(start)).chars().collect();
+            let code = code_of_line(&before, lang);
+
+            if let Some(marker) = block_comment_continuation(&before, lang) {
+                let text = format!("\n{indent}{marker}");
+                let n = text.len();
+                return (sel.range(), text, n);
+            }
+
+            let deeper = indent_for_new_line(code, &indent, lang);
+            // Brace split: `{|}` becomes an open body with the closer dedented on its own line.
+            // Only when the very next non-space character is the matching `}`.
+            let opened = deeper.len() > indent.len();
+            let next_is_close = rope
+                .slice(rope.byte_to_char(start)..)
+                .chars()
+                .find(|c| *c != ' ' && *c != '\t')
+                == Some('}');
+            if opened && next_is_close {
+                let text = format!("\n{deeper}\n{indent}");
+                // Caret on the MIDDLE line, not after the closer.
+                let caret = 1 + deeper.len();
+                return (sel.range(), text, caret);
+            }
+            let text = format!("\n{deeper}");
+            let n = text.len();
+            (sel.range(), text, n)
         });
     }
 
@@ -2548,6 +2617,37 @@ impl EditorView {
             self.selections.set_single(head + ch.len_utf8());
             buffer.seal();
             return true;
+        }
+
+        // Electric `}`: typing it on an otherwise-blank line pulls that line out one level, so
+        // a closer lands under its opener instead of under the body. Only on a blank line — a `}`
+        // typed after real code is just a character, and re-indenting there would fight the user.
+        if single
+            && empty
+            && ch == '}'
+            && self.lang.is_some_and(Lang::brace_indented)
+            && next != Some('}')
+        {
+            let line_ix = rope.byte_to_line(head);
+            let line_start = rope.line_to_byte(line_ix);
+            let before: String = rope
+                .slice(rope.byte_to_char(line_start)..rope.byte_to_char(head))
+                .chars()
+                .collect();
+            if !before.is_empty() && before.chars().all(|c| c == ' ' || c == '\t') {
+                let dedented = before.strip_suffix(TAB).map(str::to_string).unwrap_or_else(|| {
+                    // Not a full indent unit (hand-aligned, or tabs): drop one whitespace char
+                    // rather than refusing, so the closer still moves toward its opener.
+                    let mut t = before.clone();
+                    t.pop();
+                    t
+                });
+                self.apply_edits(buffer, EditKind::Other, now, move |_, _| {
+                    (line_start..head, format!("{dedented}}}"))
+                });
+                buffer.seal();
+                return true;
+            }
         }
 
         let Some(close) = open_to_close(ch) else { return false };
@@ -3438,6 +3538,108 @@ fn guide_depth(rope: &Rope, line: usize, total: usize) -> usize {
 }
 
 /// Leading whitespace of the line containing `byte` (for newline auto-indent).
+/// The CODE portion of one line: everything before a line comment or a block-comment opener,
+/// with string and character literals respected so a delimiter inside quotes never truncates it.
+///
+/// Single quotes are the trap. In JS `'{'` is a string; in Rust `'a` is a LIFETIME that never
+/// closes, and treating it as a string would swallow the rest of the line — including the `{`
+/// that decides the indent. So `'` opens a string only where the language says it can, and in
+/// C/Rust it is consumed only as a bounded character literal.
+fn code_of_line(line: &str, lang: Option<Lang>) -> &str {
+    let lc = lang.and_then(|l| l.line_comment());
+    let bc = lang.and_then(|l| l.block_comment()).map(|(o, _)| o);
+    let sq_string = lang.is_some_and(|l| l.single_quote_is_string());
+    let mut i = 0usize;
+    let mut quote: Option<char> = None;
+    while i < line.len() {
+        let Some(ch) = line[i..].chars().next() else { break };
+        match quote {
+            Some(q) => {
+                if ch == '\\' {
+                    // Skip the escape AND whatever it escapes, so `"\""` does not close early.
+                    i += ch.len_utf8();
+                    i += line[i..].chars().next().map_or(0, char::len_utf8);
+                    continue;
+                }
+                if ch == q {
+                    quote = None;
+                }
+                i += ch.len_utf8();
+            }
+            None => {
+                if lc.is_some_and(|t| line[i..].starts_with(t))
+                    || bc.is_some_and(|t| line[i..].starts_with(t))
+                {
+                    return &line[..i];
+                }
+                if ch == '"' {
+                    quote = Some(ch);
+                } else if ch == '\'' {
+                    if sq_string {
+                        quote = Some(ch);
+                    } else if let Some(len) = char_literal_len(&line[i..]) {
+                        // A complete `'x'` / `'\n'` — step over it whole. A lone `'` (Rust
+                        // lifetime, an apostrophe in a comment we have not reached yet) is just
+                        // an ordinary character and must not open anything.
+                        i += len;
+                        continue;
+                    }
+                }
+                i += ch.len_utf8();
+            }
+        }
+    }
+    line
+}
+
+/// Byte length of a complete character literal at the start of `s` (`'a'`, `'\n'`, `'\\''`),
+/// or None when `s` does not begin with one. Bounded on purpose: an unterminated `'` is a
+/// lifetime or an apostrophe, never a literal running to end of line.
+fn char_literal_len(s: &str) -> Option<usize> {
+    let mut it = s.char_indices();
+    if it.next()?.1 != '\'' {
+        return None;
+    }
+    let (_, c) = it.next()?;
+    if c == '\'' {
+        return None; // `''` is not a literal
+    }
+    if c == '\\' {
+        let _ = it.next()?; // the escaped char
+    }
+    let (i, c) = it.next()?;
+    (c == '\'').then_some(i + c.len_utf8())
+}
+
+/// The indent a NEW line should carry, given the code before the caret and the current indent.
+/// Only the open-brace rule: a trailing `{` opens a block, so the next line steps in one unit.
+fn indent_for_new_line(code_before: &str, indent: &str, lang: Option<Lang>) -> String {
+    if !lang.is_some_and(Lang::brace_indented) {
+        return indent.to_string();
+    }
+    match code_before.trim_end().ends_with('{') {
+        true => format!("{indent}{TAB}"),
+        false => indent.to_string(),
+    }
+}
+
+/// The continuation prefix for a new line inside a block comment, if we are in one.
+/// `/* …` → ` * ` (aligned under the opener's slash); `* …` → `* `.
+fn block_comment_continuation(code_line: &str, lang: Option<Lang>) -> Option<&'static str> {
+    let (open, close) = lang?.block_comment()?;
+    if open != "/*" {
+        return None; // the alignment below is specific to the /* … */ shape
+    }
+    let t = code_line.trim_start();
+    if t.contains(close) {
+        return None; // the comment already ended on this line
+    }
+    if t.starts_with(open) {
+        return Some(" * ");
+    }
+    t.starts_with('*').then_some("* ")
+}
+
 fn leading_ws(rope: &Rope, byte: usize) -> String {
     let line = rope.byte_to_line(byte);
     let mut out = String::new();
@@ -3915,6 +4117,68 @@ mod tests {
     }
 
     #[test]
+    fn code_of_line_stops_at_a_line_comment() {
+        assert_eq!(code_of_line("int x = 1; // { nope", Some(Lang::C)), "int x = 1; ");
+    }
+
+    #[test]
+    fn code_of_line_keeps_braces_inside_strings_out_of_it() {
+        // The classic false positive: a brace in a string must not open a block.
+        assert_eq!(code_of_line(r#"puts("{");"#, Some(Lang::C)), r#"puts("{");"#);
+        assert!(!code_of_line(r#"char *s = "{";"#, Some(Lang::C)).trim_end().ends_with('{'));
+    }
+
+    #[test]
+    fn rust_lifetime_does_not_swallow_the_line() {
+        // `'a` never closes. Treating it as a string would hide the trailing brace and silently
+        // disable indent for the whole body.
+        let line = "fn f<'a>(x: &'a str) {";
+        assert!(code_of_line(line, Some(Lang::Rust)).trim_end().ends_with('{'), "{line}");
+    }
+
+    #[test]
+    fn c_char_literal_brace_is_not_code() {
+        // `'{'` is one character, not an opener.
+        let line = "if (c == '{') foo();";
+        assert_eq!(code_of_line(line, Some(Lang::C)), line);
+        assert!(!code_of_line(line, Some(Lang::C)).trim_end().ends_with('{'));
+    }
+
+    #[test]
+    fn js_single_quoted_string_is_a_string() {
+        // Same character, opposite meaning from Rust/C.
+        let line = "if (s === '{') {";
+        assert!(code_of_line(line, Some(Lang::Js)).trim_end().ends_with('{'));
+        assert!(!code_of_line("x('//')", Some(Lang::Js)).is_empty());
+        assert_eq!(code_of_line("x('//')", Some(Lang::Js)), "x('//')", "// inside a string");
+    }
+
+    #[test]
+    fn indent_rules_do_not_apply_to_python() {
+        // Python indents by other means; a stray brace must not step it in.
+        assert_eq!(indent_for_new_line("d = {", "    ", Some(Lang::Python)), "    ");
+        assert_eq!(indent_for_new_line("if (x) {", "    ", Some(Lang::C)), "        ");
+    }
+
+    #[test]
+    fn block_comment_continuation_shapes() {
+        assert_eq!(block_comment_continuation("/* hi", Some(Lang::C)), Some(" * "));
+        assert_eq!(block_comment_continuation(" * hi", Some(Lang::C)), Some("* "));
+        // Already closed on this line -> not a continuation.
+        assert_eq!(block_comment_continuation("/* hi */", Some(Lang::C)), None);
+        assert_eq!(block_comment_continuation("int x;", Some(Lang::C)), None);
+        assert_eq!(block_comment_continuation("# hi", Some(Lang::Python)), None);
+    }
+
+    #[test]
+    fn char_literal_len_is_bounded() {
+        assert_eq!(char_literal_len("'a'x"), Some(3));
+        assert_eq!(char_literal_len(r"'\n'x"), Some(4));
+        assert_eq!(char_literal_len("'a"), None, "unterminated is not a literal");
+        assert_eq!(char_literal_len("''"), None);
+    }
+
+    #[test]
     fn indent_cols_counts_spaces_and_tabs() {
         let r = Rope::from_str("no\n    four\n\tone_tab\n        eight\n   \n");
         assert_eq!(indent_cols(&r, 0), Some(0)); // "no"
@@ -3987,6 +4251,70 @@ mod tests {
         v.insert_newline(&mut b, 0.0);
         assert_eq!(b.rope().to_string(), "    foo\n    ");
         assert_eq!(carets(&v), vec![12]); // after the '\n' + 4-space copied indent
+    }
+
+    #[test]
+    fn newline_after_open_brace_steps_in() {
+        let (mut v, mut b) = setup("int main(void) {");
+        v.selections = Selections::single(16);
+        v.insert_newline(&mut b, 0.0);
+        assert_eq!(b.rope().to_string(), "int main(void) {\n    ");
+    }
+
+    #[test]
+    fn newline_between_braces_opens_a_body() {
+        // `{|}` -> body line, caret on it, closer dedented on its own line.
+        let (mut v, mut b) = setup("int main(void) {}");
+        v.selections = Selections::single(16); // between { and }
+        v.insert_newline(&mut b, 0.0);
+        assert_eq!(b.rope().to_string(), "int main(void) {\n    \n}");
+        assert_eq!(carets(&v), vec![21], "caret on the BODY line, not after the closer");
+    }
+
+    #[test]
+    fn newline_inside_a_block_comment_continues_it() {
+        let (mut v, mut b) = setup("/* hello");
+        v.selections = Selections::single(8);
+        v.insert_newline(&mut b, 0.0);
+        assert_eq!(b.rope().to_string(), "/* hello\n * ");
+    }
+
+    #[test]
+    fn newline_after_a_brace_in_a_string_does_not_step_in() {
+        // The regression a naive "line ends with {" rule would introduce.
+        let (mut v, mut b) = setup("    char *s = \"{\";");
+        let n = b.rope().len_bytes();
+        v.selections = Selections::single(n);
+        v.insert_newline(&mut b, 0.0);
+        assert_eq!(b.rope().to_string(), "    char *s = \"{\";\n    ", "indent copied, not deepened");
+    }
+
+    #[test]
+    fn newline_mid_line_uses_only_the_text_before_the_caret() {
+        let (mut v, mut b) = setup("if (x) { y();");
+        v.selections = Selections::single(8); // right after `{ `
+        v.insert_newline(&mut b, 0.0);
+        assert_eq!(b.rope().to_string(), "if (x) {\n     y();");
+    }
+
+    #[test]
+    fn electric_close_brace_pulls_the_line_out_one_level() {
+        let (mut v, mut b) = setup("int f(void) {\n    x();\n    ");
+        let n = b.rope().len_bytes();
+        v.selections = Selections::single(n);
+        assert!(v.typed_char(&mut b, '}', 0.0), "electric arm must claim the keystroke");
+        assert_eq!(b.rope().to_string(), "int f(void) {\n    x();\n}");
+    }
+
+    #[test]
+    fn close_brace_after_code_is_just_a_character() {
+        // Re-indenting here would fight the user mid-line.
+        let (mut v, mut b) = setup("    x();");
+        let n = b.rope().len_bytes();
+        v.selections = Selections::single(n);
+        v.typed_char(&mut b, '}', 0.0);
+        // Either the pair logic or nothing handled it, but the leading indent must survive.
+        assert!(b.rope().to_string().starts_with("    x();"), "{}", b.rope());
     }
 
     #[test]
