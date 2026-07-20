@@ -807,7 +807,11 @@ struct App {
     /// Idle auto-save: fires once `i.time` passes this (armed by every edit drain).
     autosave_deadline: Option<f64>,
     /// Debug launch parked until the pre-debug `cargo build` in the runner exits 0.
-    debug_pending_build: Option<PathBuf>,
+    /// A debug launch parked until the pre-debug build exits 0: `(target, generation)`. A `None`
+    /// target means "rescan for executables once the build lands" — the C path cannot name its
+    /// artifact up front the way cargo can. `generation` is the [`Runner`] generation that owns
+    /// the park; any newer run cancels it (titles are ambiguous — two `cargo build`s look alike).
+    debug_pending_build: Option<(Option<PathBuf>, u64)>,
     /// Multi-target go-to-definition chooser: `(anchor pos, targets, selected)`.
     def_choices: Option<(egui::Pos2, Vec<(PathBuf, lsp_types::Position)>, usize)>,
     /// Active merge-conflict resolver: the file being resolved. Conflicts are re-parsed each
@@ -1097,6 +1101,8 @@ impl App {
             hover_popup: None,
             hover_anchor: None,
         };
+        // Seed the manager BEFORE any server spawns — clangd reads these flags only at spawn.
+        app.lsp.set_clangd_options(cauldron_lsp::ClangdOptions { clang_tidy: prefs.clang_tidy });
         if app.no_project {
             // Nothing to walk/restore — surface the picker (recents listed first) as the
             // welcome state over the existing empty-group constellation.
@@ -2045,14 +2051,39 @@ impl App {
             // Output pane; the pending watcher in update() launches lldb when it exits 0.
             self.dbg_say(format!("building before debug (cargo build) → target/debug/{name}…"));
             self.runner.start("cargo", &["build"], &root, ctx);
-            self.debug_pending_build = Some(bin);
+            self.debug_pending_build = Some((Some(bin), self.runner.generation()));
             return;
         }
-        // C/C++ workspace: debug a built executable.
+        // C/C++ workspace. BUILD FIRST when the project has a Makefile, for exactly the reason
+        // the cargo path does: `find_executables` happily returns an ELF built days ago, and
+        // debugging a stale binary — breakpoints on lines that have moved, variables that no
+        // longer exist — is a uniquely confusing failure. Rust had this guard; C did not.
+        //
+        // Deliberately Makefile-only. A CMake tree's build directory is not reliably the one
+        // clangd resolved (cFS writes a merged compile DB into a dir with no CMakeCache.txt),
+        // and guessing wrong means building something other than what runs.
+        if root.join("Makefile").exists() {
+            if self.debug_pending_build.is_some() && self.runner.running {
+                self.dbg_say("already building — waiting for it to finish");
+                return;
+            }
+            self.dbg_say("building before debug (make)…");
+            self.runner.start("make", &[], &root, ctx);
+            // No target yet: which executable exists is only knowable after the build.
+            self.debug_pending_build = Some((None, self.runner.generation()));
+            return;
+        }
+        self.debug_scan_and_launch();
+    }
+
+    /// Pick the executable to debug from whatever the workspace has built, and launch it.
+    /// Shared by the no-Makefile path and the post-build continuation.
+    fn debug_scan_and_launch(&mut self) {
+        let root = self.workspace.root.clone();
         let mut exes = find_executables(&root);
         match exes.len() {
             0 => self.dbg_say(
-                "no built executable found in the workspace — run Build (Ctrl+F9) first,                  then Debug again",
+                "no built executable found in the workspace — run Build (Ctrl+F9) first, then Debug again",
             ),
             1 => {
                 let bin = exes.remove(0);
@@ -2739,6 +2770,8 @@ impl App {
             inline_blame: self.inline_blame_enabled,
             theme: self.theme_choice,
             ai: self.ai_settings.clone(),
+            // The manager owns this — reading it back avoids a second copy that can drift.
+            clang_tidy: self.lsp.clangd_options().clang_tidy,
         });
     }
 
@@ -7003,6 +7036,8 @@ impl eframe::App for App {
         }
         let psi_was_indexing = matches!(self.psi.state, PsiState::Indexing);
         self.psi.pump();
+        // Every frame, whether or not the Output pane is drawn (see Runner::ui_embedded).
+        self.runner.pump();
         if psi_was_indexing && matches!(self.psi.state, PsiState::Ready { .. }) {
             self.refresh_nasa_squiggles();
         }
@@ -8068,16 +8103,21 @@ impl eframe::App for App {
             self.autosave_deadline = None;
             self.save_dirty(None);
         }
-        // Build-before-debug: the parked launch fires when OUR cargo build finishes. A
-        // different run replacing it in the runner (title mismatch) cancels the park.
-        if let Some(bin) = self.debug_pending_build.clone() {
-            if !self.runner.title.starts_with("cargo build") {
+        // Build-before-debug: the parked launch fires when OUR build finishes. Any newer run
+        // (the user's own Ctrl+F9, a Run, a second Debug) bumps the generation and cancels the
+        // park — a build the user started for their own reasons must not launch a debugger.
+        if let Some((target, gen)) = self.debug_pending_build.clone() {
+            if self.runner.generation() != gen {
                 self.debug_pending_build = None;
             } else if !self.runner.running {
                 self.debug_pending_build = None;
                 if self.runner.exit == Some(0) {
                     self.dbg_say("build OK — launching debugger");
-                    self.launch_lldb(bin);
+                    match target {
+                        Some(bin) => self.launch_lldb(bin),
+                        // C: the artifact is only discoverable after the build.
+                        None => self.debug_scan_and_launch(),
+                    }
                 } else {
                     self.dbg_say("build failed — fix the errors, then Debug again");
                 }
@@ -9166,6 +9206,23 @@ impl eframe::App for App {
                                     self.inlay_for = None;
                                     self.inlay_requested = None;
                                     self.save_settings();
+                                }
+                                {
+                                    // Read-modify-write through the manager, which owns the
+                                    // value; a local copy here would be a second source of truth.
+                                    let mut opts = self.lsp.clangd_options();
+                                    if ui
+                                        .checkbox(&mut opts.clang_tidy, "clang-tidy (C/C++)")
+                                        .on_hover_text(
+                                            "Run clang-tidy checks inside clangd. Restarts clangd \
+                                             (its flags are read only at startup), so diagnostics \
+                                             go quiet for a moment.",
+                                        )
+                                        .changed()
+                                    {
+                                        self.lsp.set_clangd_options(opts);
+                                        self.save_settings();
+                                    }
                                 }
                                 if ui
                                     .checkbox(

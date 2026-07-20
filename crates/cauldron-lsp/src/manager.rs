@@ -24,7 +24,7 @@ use cauldron_editor::syntax::Lang;
 use ropey::Rope;
 use serde_json::{json, Value};
 
-use crate::server::{DocState, LspServer, Outgoing, PendingKind, Raw};
+use crate::server::{ClangdOptions, DocState, LspServer, Outgoing, PendingKind, Raw};
 use crate::{discovery, txsync, Encoding, LspEvent, Notifier, ServerId, ServerKind, ServerState};
 
 /// rust-analyzer native-diagnostics pull debounce (sliding, per doc).
@@ -57,6 +57,9 @@ pub struct LspManager {
     /// Finished background installs: `(kind, root, success)` → respawn on success.
     install_rx: Receiver<(ServerKind, PathBuf, bool)>,
     install_tx: Sender<(ServerKind, PathBuf, bool)>,
+    /// clangd CLI knobs. The manager is the single owner: the app reads them back through
+    /// [`LspManager::clangd_options`] rather than keeping a second copy that can drift.
+    clangd_opts: ClangdOptions,
 }
 
 impl LspManager {
@@ -77,6 +80,7 @@ impl LspManager {
             install_attempted: std::collections::HashSet::new(),
             install_rx,
             install_tx,
+            clangd_opts: ClangdOptions::default(),
         }
     }
 
@@ -535,6 +539,13 @@ impl LspManager {
                 Raw::InitResult(result) => {
                     let server = self.servers.get_mut(&key).unwrap();
                     server.finish_initialize(&result);
+                    // A COMPLETED handshake retires the crash history. `restarts` only ever grew,
+                    // so a server that crashed MAX_RESTARTS times over a long session was declared
+                    // permanently dead even though every single respawn had succeeded — and the
+                    // backoff kept climbing toward its 60s ceiling for the same reason. Crash
+                    // counting is meant to catch a server that CANNOT start, not one that has
+                    // hiccuped a few times across eight hours.
+                    self.restarts.remove(&key);
                     out.push((sid, LspEvent::State(ServerState::Ready)));
                     // Synthesize didOpen for every tracked doc with its CURRENT text.
                     let docs: Vec<(PathBuf, i32)> =
@@ -718,6 +729,21 @@ impl LspManager {
     /// Force-restart every server of `kind`: kill the child; the reader hits EOF, the normal
     /// crash/respawn path re-runs discovery (picking up a freshly generated compile DB) and
     /// re-opens all docs. Used after dependency auto-resolution lands a better DB.
+    pub fn clangd_options(&self) -> ClangdOptions {
+        self.clangd_opts
+    }
+
+    /// Change clangd's CLI knobs. A real change bounces every clangd, since the flags are only
+    /// read at spawn. A no-op change must NOT restart — the settings dialog writes on every
+    /// keystroke elsewhere in the file, and bouncing the server on each one would be brutal.
+    pub fn set_clangd_options(&mut self, opts: ClangdOptions) {
+        if self.clangd_opts == opts {
+            return;
+        }
+        self.clangd_opts = opts;
+        self.restart_kind(ServerKind::Clangd);
+    }
+
     pub fn restart_kind(&mut self, kind: ServerKind) {
         for ((k, _), s) in self.servers.iter_mut() {
             if *k == kind {
@@ -844,6 +870,7 @@ impl LspManager {
             *kind,
             root,
             compile_db.as_ref(),
+            self.clangd_opts,
             self.events_tx.clone(),
             Arc::clone(&self.notifier),
         ) {

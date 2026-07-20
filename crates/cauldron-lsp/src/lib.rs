@@ -26,6 +26,7 @@ pub mod txsync;
 
 pub use lsp_types;
 pub use manager::LspManager;
+pub use server::ClangdOptions;
 
 /// Wakes the UI thread after an event lands on the queue (`ctx.request_repaint()` in the app;
 /// a no-op closure in tests). Injected so this crate never depends on egui.

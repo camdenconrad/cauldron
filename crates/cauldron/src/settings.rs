@@ -128,6 +128,9 @@ pub struct Settings {
     /// AI backend (Claude sign-in vs local Ollama).
     #[serde(default)]
     pub ai: AiSettings,
+    /// Run clang-tidy inside clangd (C/C++ diagnostics beyond the compiler's own).
+    #[serde(default = "default_true")]
+    pub clang_tidy: bool,
 }
 
 impl Default for Settings {
@@ -140,6 +143,7 @@ impl Default for Settings {
             inline_blame: true,
             theme: ThemeChoice::Dark,
             ai: AiSettings::default(),
+            clang_tidy: true,
         }
     }
 }
@@ -204,9 +208,18 @@ mod tests {
                 ollama_chat_model: "llama3:8b".into(),
                 ..Default::default()
             },
+            clang_tidy: false,
         };
         let back: Settings = serde_json::from_str(&serde_json::to_string(&s).unwrap()).unwrap();
         assert_eq!(back, s);
+    }
+
+    /// An older settings file predates `clang_tidy`; it must load and take the default rather
+    /// than failing the WHOLE file (serde would otherwise reject the missing field).
+    #[test]
+    fn settings_file_without_clang_tidy_still_loads() {
+        let s: Settings = serde_json::from_str(r#"{"editor_font": 14.0}"#).unwrap();
+        assert!(s.clang_tidy, "missing field must default to on");
     }
 
     /// A file with no fields at all (or unknown ones) still loads, on defaults.
@@ -265,6 +278,7 @@ mod tests {
             inline_blame: true,
             theme: ThemeChoice::Dark,
             ai: AiSettings::default(),
+            clang_tidy: true,
         });
         let back = load();
         assert_eq!(back.editor_font, FONT_MAX, "hostile value clamped on load");

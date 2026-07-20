@@ -930,9 +930,13 @@ fn file_command(file: &Path, root: &Path, extra: &[String]) -> Option<(String, V
     let dir_q = sh_quote(&out.parent().unwrap_or(Path::new("/tmp")).to_string_lossy());
     let args_q: Vec<String> = extra.iter().map(|a| sh_quote(a)).collect();
     let rest = args_q.join(" ");
+    // `-g -O0`: the artifact this produces is the SAME one Debug-current-file attaches to, and
+    // without debug info lldb has no line table, no locals, and no breakpoint resolution — the
+    // whole debug path was unusable on a single file. -O0 keeps stepping honest (no reordered
+    // lines, no elided variables); a one-file script is never being run for its throughput.
     let compile_run = |cc: &str, std_flag: &str| {
         let script = format!(
-            "mkdir -p {dir_q} && rm -f {out_q} && {cc} {std_flag} -Wall -o {out_q} {src} \
+            "mkdir -p {dir_q} && rm -f {out_q} && {cc} {std_flag} -g -O0 -Wall -o {out_q} {src} \
              && exec {out_q} {rest}",
             src = sh_quote(&path),
         );
@@ -2091,5 +2095,50 @@ mod tests {
         let uv = cfgs.iter().find(|c| c.kind == RunKind::Uvicorn).expect("uvicorn detected");
         assert_eq!(uv.program, "svc.app:app");
         let _ = std::fs::remove_dir_all(&root);
+    }
+}
+
+#[cfg(test)]
+mod single_file_debug_tests {
+    use super::*;
+
+    fn script_for(name: &str) -> String {
+        let cfg = RunConfig {
+            name: "t".into(),
+            kind: RunKind::File,
+            program: format!("/tmp/{name}"),
+            args: Vec::new(),
+            cwd: None,
+            env: Vec::new(),
+        };
+        let (prog, args, _) = command_line(&cfg, Path::new("/tmp"));
+        assert_eq!(prog, "sh");
+        args.get(1).cloned().unwrap_or_default()
+    }
+
+    /// The artifact a single-file Run produces is the same one Debug attaches to, so it must
+    /// carry debug info. Without -g there is no line table and lldb cannot bind a breakpoint.
+    #[test]
+    fn single_file_c_compiles_with_debug_info() {
+        let s = script_for("x.c");
+        assert!(s.contains(" -g "), "C compile line lacks -g: {s}");
+        assert!(s.contains(" -O0 "), "C compile line lacks -O0: {s}");
+    }
+
+    #[test]
+    fn single_file_cpp_compiles_with_debug_info() {
+        let s = script_for("x.cpp");
+        assert!(s.contains(" -g "), "C++ compile line lacks -g: {s}");
+        assert!(s.contains(" -O0 "), "C++ compile line lacks -O0: {s}");
+    }
+
+    /// The artifact path must be STABLE for the same source: a debugger is pointed at it after
+    /// the build, and a randomized name would leave nothing to attach to.
+    #[test]
+    fn run_artifact_is_deterministic() {
+        let a = run_artifact(Path::new("/tmp/x.c"), "x");
+        let b = run_artifact(Path::new("/tmp/x.c"), "x");
+        assert_eq!(a, b);
+        assert_ne!(a, run_artifact(Path::new("/other/x.c"), "x"), "distinct sources, distinct artifacts");
     }
 }

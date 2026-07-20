@@ -100,6 +100,13 @@ impl Runner {
         let mut child = match spawned {
             Ok(c) => c,
             Err(e) => {
+                // Clear `running` explicitly. `start` already stopped the previous child and
+                // bumped the generation, so that child's `Done` is now dropped by pump as stale —
+                // leaving a failed spawn to inherit the old `true` forever. The toolbar then shows
+                // a Stop button for nothing, and anything parked on "the run finished" never
+                // resolves.
+                self.running = false;
+                self.exit = None;
                 self.lines.push(format!("failed to start {program}: {e}"));
                 return;
             }
@@ -151,6 +158,14 @@ impl Runner {
         }
     }
 
+    /// The current run's generation. A caller parking work on "this build finishing" stores
+    /// this and compares later: a NEW run (Ctrl+F9, Run, another debug) bumps it, which cancels
+    /// the park unambiguously. Matching on `title` instead was wrong — two `cargo build` runs
+    /// produce identical titles, so a user's own build could satisfy someone else's park.
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+
     /// Drain events; call once per frame before drawing.
     pub fn pump(&mut self) {
         while let Ok(ev) = self.rx.try_recv() {
@@ -179,7 +194,11 @@ impl Runner {
 
     /// The Output body, embedded in the dock's right slot (the dock owns tabs/close/resize).
     pub fn ui_embedded(&mut self, ui: &mut egui::Ui) {
-        self.pump();
+        // NOT pumped here. Draining only while the Output pane is drawn meant a build whose pane
+        // was hidden (another bottom tab, or the dock closed) never observed its own completion:
+        // `running` stayed true forever, the child's output buffered unboundedly in the channel,
+        // and anything parked on "the build finished" — build-before-debug — silently never
+        // fired. App::update pumps once per frame instead, visible or not.
         ui.horizontal(|ui| {
             ui.colored_label(DIM, &self.title);
             if self.running {
@@ -234,4 +253,38 @@ pub(crate) fn kill_process_group(child: &mut Child) {
     }
     // Fallback (non-unix, or the group kill raced the child's exit) — a double kill is a no-op.
     let _ = child.kill();
+}
+
+#[cfg(test)]
+mod runner_tests {
+    use super::*;
+
+    /// A park on "this build finished" is keyed on the generation, so it must advance on every
+    /// start — otherwise a second run could satisfy the first run's park.
+    #[test]
+    fn generation_advances_on_every_start() {
+        let ctx = egui::Context::default();
+        let mut r = Runner::default();
+        let g0 = r.generation();
+        r.start("true", &[], Path::new("/"), &ctx);
+        let g1 = r.generation();
+        assert!(g1 > g0, "start must bump the generation");
+        r.start("true", &[], Path::new("/"), &ctx);
+        assert!(r.generation() > g1, "and again");
+    }
+
+    /// A spawn that cannot even start must not leave the runner looking busy forever.
+    #[test]
+    fn failed_spawn_clears_running() {
+        let ctx = egui::Context::default();
+        let mut r = Runner::default();
+        r.running = true; // as if a previous run were live
+        r.start("cauldron-no-such-program-xyz", &[], Path::new("/"), &ctx);
+        assert!(!r.running, "a failed spawn must clear running, not inherit the old value");
+        assert!(
+            r.lines.iter().any(|l| l.contains("failed to start")),
+            "and must say so: {:?}",
+            r.lines
+        );
+    }
 }

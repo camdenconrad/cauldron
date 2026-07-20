@@ -14,7 +14,7 @@
 
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, Sender};
@@ -63,6 +63,42 @@ pub(crate) enum PendingKind {
     /// A request whose response carries nothing we act on (e.g. `workspace/executeCommand` —
     /// any resulting edits arrive separately as a server→client `workspace/applyEdit`).
     Generic,
+}
+
+/// clangd command-line knobs the user controls. Kept out of `initializationOptions` because
+/// clangd genuinely has none — it is configured by CLI flags and `.clangd` files only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ClangdOptions {
+    /// Run clang-tidy checks alongside the compiler diagnostics.
+    pub clang_tidy: bool,
+}
+
+impl Default for ClangdOptions {
+    fn default() -> Self {
+        // ON. The historical `--clang-tidy=0` was justified by double-reporting against
+        // `cauldron-lint`, but that crate emits ONLY JPL Power-of-Ten findings (recursion, goto,
+        // function length, dynamic allocation, loop bounds, pointer depth, preprocessor use).
+        // clang-tidy's bugprone-*/clang-analyzer-*/readability-* families barely intersect that,
+        // so suppressing it cost most of clangd's actionable diagnostics to avoid an overlap that
+        // is nearly empty.
+        Self { clang_tidy: true }
+    }
+}
+
+/// clangd's argv for `opts`. Split out so it is testable without spawning a process.
+pub(crate) fn clangd_args(opts: ClangdOptions, compile_db: Option<&Path>) -> Vec<String> {
+    let mut v = vec![
+        "--background-index".to_string(),
+        format!("--clang-tidy={}", u8::from(opts.clang_tidy)),
+        // Auto-insertion stays off: it edits the buffer as a side effect of accepting a
+        // completion, which is a separate decision from running tidy checks.
+        "--header-insertion=never".to_string(),
+        "--log=error".to_string(),
+    ];
+    if let Some(db) = compile_db {
+        v.push(format!("--compile-commands-dir={}", db.display()));
+    }
+    v
 }
 
 #[derive(Debug)]
@@ -125,16 +161,15 @@ impl LspServer {
         kind: ServerKind,
         root: &PathBuf,
         compile_db: Option<&PathBuf>,
+        clangd: ClangdOptions,
         events_tx: Sender<(ServerId, Raw)>,
         notifier: Notifier,
     ) -> std::io::Result<Self> {
         let mut cmd = match kind {
             ServerKind::Clangd => {
                 let mut c = Command::new("clangd");
-                // NASA layer owns clang-tidy (double-reporting otherwise); stderr tamed but drained.
-                c.args(["--background-index", "--clang-tidy=0", "--header-insertion=never", "--log=error"]);
-                if let Some(db) = compile_db {
-                    c.arg(format!("--compile-commands-dir={}", db.display()));
+                for a in clangd_args(clangd, compile_db.map(PathBuf::as_path)) {
+                    c.arg(a);
                 }
                 c
             }
@@ -846,6 +881,43 @@ mod tests {
                 assert_eq!(symbols[1].kind, lsp_types::SymbolKind::STRUCT);
             }
             other => panic!("expected WorkspaceSymbols event, got {other:?}"),
+        }
+    }
+}
+
+#[cfg(test)]
+mod clangd_arg_tests {
+    use super::*;
+
+    #[test]
+    fn clang_tidy_flag_tracks_the_option() {
+        let on = clangd_args(ClangdOptions { clang_tidy: true }, None);
+        assert!(on.iter().any(|a| a == "--clang-tidy=1"), "{on:?}");
+        let off = clangd_args(ClangdOptions { clang_tidy: false }, None);
+        assert!(off.iter().any(|a| a == "--clang-tidy=0"), "{off:?}");
+    }
+
+    /// The compile-DB directory is what makes clangd accurate; losing it silently would degrade
+    /// every diagnostic without any visible error.
+    #[test]
+    fn compile_db_dir_is_passed_through() {
+        let args = clangd_args(ClangdOptions::default(), Some(Path::new("/w/build")));
+        assert!(args.iter().any(|a| a == "--compile-commands-dir=/w/build"), "{args:?}");
+        assert!(
+            !clangd_args(ClangdOptions::default(), None)
+                .iter()
+                .any(|a| a.starts_with("--compile-commands-dir")),
+            "no DB must mean no flag, not an empty one"
+        );
+    }
+
+    /// Accepting a completion must not silently edit the file's includes; that is a separate
+    /// decision from running tidy checks and stays off regardless.
+    #[test]
+    fn header_insertion_stays_off() {
+        for tidy in [true, false] {
+            let a = clangd_args(ClangdOptions { clang_tidy: tidy }, None);
+            assert!(a.iter().any(|x| x == "--header-insertion=never"), "{a:?}");
         }
     }
 }
