@@ -101,6 +101,10 @@ pub struct Workspace {
     dirty_dirs: HashSet<PathBuf>,
     /// Workspace-relative path of the file highlighted in the tree.
     selected: Option<PathBuf>,
+    /// A pending Alt+F1: expand every ancestor of this workspace-relative path and scroll it into
+    /// view. Deferred to `tree_ui` because a header's open state is keyed by an egui id that only
+    /// exists inside the tree's own `Ui` — it cannot be set from the app.
+    reveal: Option<PathBuf>,
     /// Workspace-relative files with at least one error diagnostic (get the squiggle).
     problem_files: HashSet<PathBuf>,
     /// Ancestor dirs of `problem_files` — IntelliJ-style: the squiggle climbs the tree.
@@ -152,6 +156,7 @@ impl Workspace {
             git: HashMap::new(),
             dirty_dirs: HashSet::new(),
             selected: None,
+            reveal: None,
             problem_files: HashSet::new(),
             problem_dirs: HashSet::new(),
             refresh_tx,
@@ -305,6 +310,10 @@ impl Workspace {
         let mut action: Option<TreeAction> = None;
         // Root-level context: right-click the empty space below the tree (a full-width strip).
         self.children_ui(ui, &self.tree, &mut action);
+        // One-shot: the pass above expanded the ancestors and scrolled the row into view.
+        // Holding it would re-force those folders open every frame, so the user could never
+        // collapse them again.
+        self.reveal = None;
         let (rest, resp) = ui.allocate_exact_size(
             egui::Vec2::new(ui.available_width(), ui.available_height().max(24.0)),
             egui::Sense::click(),
@@ -329,6 +338,19 @@ impl Workspace {
         action
     }
 
+    /// Alt+F1: select `abs` in the tree and open every folder on the way to it.
+    pub fn reveal(&mut self, abs: &Path) {
+        if let Ok(rel) = abs.strip_prefix(&self.root) {
+            self.selected = Some(rel.to_path_buf());
+            self.reveal = Some(rel.to_path_buf());
+        }
+    }
+
+    /// Is `dir` an ancestor of a pending reveal target (so it must be forced open)?
+    fn on_reveal_path(&self, dir: &Path) -> bool {
+        self.reveal.as_ref().is_some_and(|t| t.starts_with(dir))
+    }
+
     /// One level of the tree: collapsing headers for subdirs (dirs first), then file rows.
     /// Right-click menus on both bubble [`TreeAction`]s (paths stay workspace-relative here).
     fn children_ui(&self, ui: &mut egui::Ui, node: &DirNode, action: &mut Option<TreeAction>) {
@@ -336,6 +358,14 @@ impl Workspace {
             // Recover the header's persisted open state BEFORE building it (same id derivation
             // as CollapsingHeader::id_salt) so the label can highlight open folders.
             let id = ui.make_persistent_id(egui::Id::new(&dir.rel));
+            // A pending reveal forces this branch open before the header is built, so the target
+            // is actually laid out (and therefore scrollable to) on this same frame.
+            if self.on_reveal_path(&dir.rel) {
+                let mut st =
+                    egui::collapsing_header::CollapsingState::load_with_default_open(ui.ctx(), id, false);
+                st.set_open(true);
+                st.store(ui.ctx());
+            }
             let open = egui::collapsing_header::CollapsingState::load(ui.ctx(), id)
                 .is_some_and(|s| s.is_open());
             let header = egui::CollapsingHeader::new(self.dir_header_text(ui, dir, open))
@@ -394,6 +424,11 @@ impl Workspace {
                 let r = resp.rect;
                 let pad = ui.spacing().button_padding.x;
                 squiggle(ui, r.left() + pad, r.right() - pad, r.bottom() - 1.5);
+            }
+            // The reveal target is finally laid out — bring it on screen. Cleared by tree_ui
+            // after the pass, so this fires once.
+            if self.reveal.as_deref() == Some(file.rel.as_path()) {
+                resp.scroll_to_me(Some(egui::Align::Center));
             }
             if resp.clicked_by(egui::PointerButton::Primary) {
                 *action = Some(TreeAction::Open(file.rel.clone()));

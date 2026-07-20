@@ -83,6 +83,11 @@ impl QuickOpen {
 
     /// Draw the overlay if open. Returns `Some(path)` the frame a file is chosen (which also
     /// closes the picker). Esc / clicking away closes it, returning `None`.
+    /// The 1-based line the current query asks for, if it carries a `:42` suffix.
+    pub fn requested_line(&self) -> Option<usize> {
+        split_line_suffix(&self.query).1
+    }
+
     pub fn ui(&mut self, ctx: &egui::Context) -> Option<PathBuf> {
         if !self.open {
             return None;
@@ -178,15 +183,20 @@ impl QuickOpen {
         }
         self.results_for = Some(self.query.clone());
         self.selected = 0;
+        // `main.c:42` means "open main.c at line 42": only the name half is matched. Pasting a
+        // compiler/grep location straight into the picker is the whole point, so the suffix must
+        // not poison the score.
+        let (name_part, _) = split_line_suffix(&self.query);
+        let query = name_part.to_string();
 
-        if self.query.is_empty() {
+        if query.is_empty() {
             // Empty query: show everything in the workspace's natural (sorted) order.
             self.results = (0..self.entries.len()).collect();
             self.results.truncate(MAX_RESULTS * 4);
             return;
         }
 
-        let pattern = Pattern::parse(&self.query, CaseMatching::Smart, Normalization::Smart);
+        let pattern = Pattern::parse(&query, CaseMatching::Smart, Normalization::Smart);
         let mut buf = Vec::new();
         let mut scored: Vec<(u32, usize)> = self
             .entries
@@ -246,5 +256,66 @@ mod tests {
         qo.recompute_if_changed();
         assert!(!qo.results.is_empty());
         assert_eq!(qo.entries[qo.results[0]].rel, "src/workspace.rs");
+    }
+}
+
+/// Split a picker query into its name part and an optional 1-based line number.
+///
+/// `main.c:42` -> ("main.c", Some(42)); `main.c:42:9` -> ("main.c", Some(42)) (a column follows
+/// the same convention as compiler output and is ignored — the picker positions by line).
+/// A trailing bare `:` is treated as "still typing" and matched as a plain name, so results do
+/// not flicker away between the colon and the digits.
+fn split_line_suffix(query: &str) -> (&str, Option<usize>) {
+    let Some((name, rest)) = query.rsplit_once(':') else { return (query, None) };
+    // `main.c:42:9` — take the LINE, drop the column.
+    let (name, rest) = match name.rsplit_once(':') {
+        Some((n, mid)) if mid.chars().all(|c| c.is_ascii_digit()) && !mid.is_empty() => (n, mid),
+        _ => (name, rest),
+    };
+    if rest.is_empty() || !rest.chars().all(|c| c.is_ascii_digit()) {
+        return (query, None);
+    }
+    match rest.parse::<usize>() {
+        Ok(n) if n > 0 => (name, Some(n)),
+        _ => (query, None),
+    }
+}
+
+#[cfg(test)]
+mod line_suffix_tests {
+    use super::split_line_suffix;
+
+    #[test]
+    fn plain_names_are_untouched() {
+        assert_eq!(split_line_suffix("main.c"), ("main.c", None));
+        assert_eq!(split_line_suffix(""), ("", None));
+    }
+
+    #[test]
+    fn line_suffix_is_split_off() {
+        assert_eq!(split_line_suffix("main.c:42"), ("main.c", Some(42)));
+    }
+
+    #[test]
+    fn compiler_style_line_and_column_keeps_the_line() {
+        assert_eq!(split_line_suffix("src/main.c:42:9"), ("src/main.c", Some(42)));
+    }
+
+    #[test]
+    fn a_half_typed_suffix_still_matches_by_name() {
+        // Between the colon and the digits the results must not vanish.
+        assert_eq!(split_line_suffix("main.c:"), ("main.c:", None));
+    }
+
+    #[test]
+    fn non_numeric_after_a_colon_is_part_of_the_name() {
+        // Windows drive letters and namespaced names must not be mangled.
+        assert_eq!(split_line_suffix("C:foo"), ("C:foo", None));
+        assert_eq!(split_line_suffix("std::vector"), ("std::vector", None));
+    }
+
+    #[test]
+    fn line_zero_is_not_a_line() {
+        assert_eq!(split_line_suffix("main.c:0"), ("main.c:0", None));
     }
 }

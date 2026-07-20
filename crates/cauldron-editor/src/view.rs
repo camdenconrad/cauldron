@@ -171,6 +171,10 @@ pub struct EditorView {
     /// AI inline (ghost) completion pinned to a caret byte + buffer generation. Cleared the
     /// moment either drifts. Tab accepts, Esc dismisses.
     ghost: Option<Ghost>,
+    /// Ctrl+Shift+F7: byte spans of the identifier being highlighted across this file, plus the
+    /// generation they were computed against. Painted like find matches but in a distinct wash,
+    /// and cleared by Escape or by any edit.
+    usage_marks: Option<(u64, Vec<Range<usize>>)>,
     /// Ctrl+W history: `(buffer generation, one range stack per caret)`, innermost first with
     /// `at` marking the current rung. NOT invalidated from the many caret-moving paths — that
     /// would be a bug farm. Instead [`Self::expand_valid`] checks that every caret still sits on
@@ -580,6 +584,7 @@ impl EditorView {
             caret_pos: None,
             ghost: None,
             expand: None,
+            usage_marks: None,
             ghost_accepted: false,
             blink_epoch: 0.0,
             blink_head: 0,
@@ -611,6 +616,8 @@ impl EditorView {
 
     /// Paint + drive the editor for one frame.
     pub fn ui(&mut self, ui: &mut egui::Ui, buffer: &mut Buffer) {
+        // Captured before the painting closure borrows `self`.
+        let buf_generation = buffer.generation;
         let font = FontId::monospace(self.font_size);
         let row_h = ui.fonts(|f| f.row_height(&font)) + LINE_PAD;
         self.last_row_h = row_h;
@@ -1221,6 +1228,14 @@ impl EditorView {
             });
             if self.find.open && !self.find.matches.is_empty() {
                 Self::paint_find_matches(&self.find, painter, &geoms, rope, text_left, row_h);
+            }
+            // Ctrl+Shift+F7 marks. Dropped the moment the buffer changes: the spans are byte
+            // offsets into the text they were computed from, and painting them over edited text
+            // would light up the wrong words.
+            if let Some((gen, marks)) = &self.usage_marks {
+                if *gen == buf_generation {
+                    Self::paint_usage_marks(marks, painter, &geoms, rope, text_left, row_h);
+                }
             }
             if !self.diagnostics.is_empty() {
                 let pointer = ui.input(|i| i.pointer.hover_pos());
@@ -1940,6 +1955,46 @@ impl EditorView {
         }
     }
 
+    /// Ctrl+Shift+F7: mark every occurrence of the identifier under the caret in THIS file.
+    ///
+    /// Whole-word, case-sensitive, and literal — this is the cheap in-file companion to Find
+    /// Usages, not a semantic search. It deliberately does not consult the language server: it
+    /// must answer instantly on every keystroke-free frame, and a stale LSP answer painted over
+    /// live text is worse than an honest lexical one.
+    pub fn highlight_usages(&mut self, buffer: &Buffer) {
+        let rope = buffer.rope();
+        let w = selection::word_range(rope, self.selections.primary().head);
+        if w.is_empty() {
+            self.usage_marks = None;
+            return;
+        }
+        let needle: String = rope.byte_slice(w).into();
+        let hay = rope.to_string();
+        let mut marks = Vec::new();
+        let mut at = 0usize;
+        while let Some(off) = hay[at..].find(&needle) {
+            let s = at + off;
+            let e = s + needle.len();
+            // Whole word only: `count` must not light up inside `counter` or `recount`.
+            let before_ok = s == 0 || !is_word_byte(hay.as_bytes()[s - 1]);
+            let after_ok = e >= hay.len() || !is_word_byte(hay.as_bytes()[e]);
+            if before_ok && after_ok {
+                marks.push(s..e);
+            }
+            at = e.max(s + 1);
+        }
+        self.usage_marks = Some((buffer.generation, marks));
+    }
+
+    /// Are usage marks currently shown? Lets the app route Escape to clearing them first.
+    pub fn usage_marks_shown(&self) -> bool {
+        self.usage_marks.is_some()
+    }
+
+    pub fn clear_usage_marks(&mut self) {
+        self.usage_marks = None;
+    }
+
     /// Install an AI ghost completion (shown dimmed at the caret; Tab accepts).
     pub fn set_ghost(&mut self, byte: usize, generation: u64, text: String) {
         if !text.is_empty() {
@@ -2059,6 +2114,11 @@ impl EditorView {
                     // else entirely.
                     self.ghost_accepted = true;
                 }
+            }
+            // Escape clears usage marks before anything else claims it — they are the most
+            // recently raised transient state on screen.
+            Key::Escape if self.usage_marks.is_some() && self.ghost.is_none() => {
+                self.usage_marks = None;
             }
             Key::Escape if self.ghost.is_some() => {
                 self.ghost = None;
@@ -3414,6 +3474,39 @@ impl EditorView {
     }
 
     /// Paint every visible match with a dim wash; the current match gets an outline.
+    /// The Ctrl+Shift+F7 wash. Deliberately a different tint from find matches — the two can be
+    /// on screen together and must stay distinguishable.
+    fn paint_usage_marks(
+        marks: &[Range<usize>],
+        painter: &egui::Painter,
+        geoms: &[LineGeom],
+        rope: &Rope,
+        text_left: f32,
+        row_h: f32,
+    ) {
+        const WASH: Color32 = Color32::from_rgba_premultiplied(20, 38, 30, 52);
+        for geom in geoms {
+            let line_start = rope.line_to_byte(geom.line);
+            let line_end = line_start + rope.line(geom.line).len_bytes();
+            for m in marks.iter().filter(|m| m.start < line_end && m.end > line_start) {
+                let s = m.start.max(line_start);
+                let e = m.end.min(line_end);
+                let (sx, sy) = Self::caret_xy(geom, Self::cidx_of(rope, geom, s));
+                let (ex, _) = Self::caret_xy(geom, Self::cidx_of(rope, geom, e));
+                if ex > sx {
+                    painter.rect_filled(
+                        egui::Rect::from_min_max(
+                            Pos2::new(text_left + sx, geom.top + sy),
+                            Pos2::new(text_left + ex, geom.top + sy + row_h),
+                        ),
+                        2.0,
+                        WASH,
+                    );
+                }
+            }
+        }
+    }
+
     fn paint_find_matches(
         find: &FindState,
         painter: &egui::Painter,
@@ -3960,6 +4053,10 @@ fn inner_span(rope: &Rope, outer: &Range<usize>) -> Range<usize> {
         e -= 1;
     }
     s..e
+}
+
+fn is_word_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'_' || b >= 0x80
 }
 
 fn leading_ws(rope: &Rope, byte: usize) -> String {
@@ -4642,6 +4739,39 @@ mod tests {
     fn sel_text(v: &EditorView, b: &Buffer) -> String {
         let r = v.selections.primary().range();
         b.rope().byte_slice(r).into()
+    }
+
+    #[test]
+    fn highlight_usages_marks_whole_words_only() {
+        let (mut v, mut b) = setup("int count; int counter; count = count + 1;\n");
+        let at = b.rope().to_string().find("count").unwrap();
+        v.selections = Selections::single(at + 1);
+        v.highlight_usages(&b);
+        let (_, marks) = v.usage_marks.clone().unwrap();
+        let hay = b.rope().to_string();
+        for m in &marks {
+            assert_eq!(&hay[m.clone()], "count");
+        }
+        // `count` declared once, assigned once, read once — `counter` must NOT be among them.
+        assert_eq!(marks.len(), 3, "got {marks:?}");
+    }
+
+    #[test]
+    fn highlight_usages_off_a_word_marks_nothing() {
+        let (mut v, mut b) = setup("int a;   int b;\n");
+        v.selections = Selections::single(7); // whitespace
+        v.highlight_usages(&b);
+        assert!(v.usage_marks.as_ref().is_none_or(|(_, m)| m.is_empty()));
+    }
+
+    #[test]
+    fn escape_clears_usage_marks() {
+        let (mut v, mut b) = setup("int x; x = 1;\n");
+        v.selections = Selections::single(4);
+        v.highlight_usages(&b);
+        assert!(v.usage_marks_shown());
+        v.handle_key(&mut b, Key::Escape, egui::Modifiers::default(), 0.0);
+        assert!(!v.usage_marks_shown());
     }
 
     #[test]

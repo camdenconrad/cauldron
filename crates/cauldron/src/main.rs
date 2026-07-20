@@ -769,6 +769,10 @@ struct App {
     git_panel: GitPanel,
     /// Ctrl+G goto-line overlay: Some(buffer text) while open.
     goto_line: Option<String>,
+    /// Where the most recent buffer change landed — the Ctrl+Shift+Backspace target. Survives
+    /// navigating away, which is the entire point: it is how you get back to what you were
+    /// writing after chasing a definition across the tree.
+    last_edit: Option<(PathBuf, usize)>,
     /// Shift+F6 rename overlay: (new-name buffer, path, byte, generation).
     rename: Option<(String, PathBuf, usize, u64)>,
     /// Find-usages results for the dock tab: (display rel, path, line, preview).
@@ -1046,6 +1050,7 @@ impl App {
             fix_request_refactor: false,
             git_panel: GitPanel::default(),
             goto_line: None,
+            last_edit: None,
             rename: None,
             usages: Vec::new(),
             usages_gen: None,
@@ -3559,6 +3564,21 @@ impl App {
                 self.bottom_open = true;
             }
             C::SwitchHeaderSource => self.switch_header_source(),
+            C::HighlightUsagesInFile => {
+                let g = &mut self.groups[self.focused];
+                let a = g.active;
+                if let Some(f) = g.files.get_mut(a) {
+                    if f.loaded {
+                        let b = &f.buffer;
+                        f.view.highlight_usages(b);
+                    }
+                }
+            }
+            C::LastEditLocation => match self.last_edit.clone() {
+                Some((p, b)) => self.navigate_to(p, b),
+                None => self.lsp_message = Some("no edit recorded yet".into()),
+            },
+            C::RevealInProject => self.reveal_active_file(),
             C::ExpandSelection => self.editor_command(ctx, |v, b, _| v.expand_selection(b)),
             C::ShrinkSelection => self.editor_command(ctx, |v, b, _| v.shrink_selection(b)),
             C::SortLines => self.editor_command(ctx, |v, b, n| v.sort_lines(b, n, false)),
@@ -6393,6 +6413,32 @@ impl App {
     }
 
     /// Ctrl+G: open the go-to-line prompt as the only overlay.
+    /// Alt+F1: show (and select) the active file in the project tree, opening its folders.
+    fn reveal_active_file(&mut self) {
+        let Some(path) = self.groups[self.focused]
+            .files
+            .get(self.groups[self.focused].active)
+            .map(|f| f.path.clone())
+        else {
+            return;
+        };
+        self.project_open = true; // revealing into a hidden panel would be a no-op
+        self.workspace.reveal(&path);
+    }
+
+    /// Jump the focused editor to a 1-based line, clamped to the file. Routed through
+    /// `navigate_to` so the jump joins the Back/Forward list, same as Go to Line.
+    fn goto_line_1based(&mut self, line: usize) {
+        let dest = self.groups[self.focused].active_file().map(|f| {
+            let rope = f.buffer.rope();
+            let l = line.saturating_sub(1).min(rope.len_lines().saturating_sub(1));
+            (f.path.clone(), rope.line_to_byte(l))
+        });
+        if let Some((path, byte)) = dest {
+            self.navigate_to(path, byte);
+        }
+    }
+
     fn open_goto_line(&mut self) {
         self.close_overlays();
         self.goto_line = Some(String::new());
@@ -7425,6 +7471,17 @@ impl eframe::App for App {
         if cmd(egui::Key::F2) {
             self.stop_run();
         }
+        // Ctrl+Shift+Backspace = jump to the last edit; Alt+F1 = reveal in the project tree.
+        if ctx.input(|i| i.modifiers.command && i.modifiers.shift && i.key_pressed(egui::Key::Backspace))
+        {
+            self.run_command(palette::Command::LastEditLocation, ctx);
+        }
+        if ctx.input(|i| i.modifiers.command && i.modifiers.shift && i.key_pressed(egui::Key::F7)) {
+            self.run_command(palette::Command::HighlightUsagesInFile, ctx);
+        }
+        if ctx.input(|i| i.modifiers.alt && i.key_pressed(egui::Key::F1)) {
+            self.reveal_active_file();
+        }
         // Ctrl+Alt+Home = header/source switch, the C keystroke every IDE binds here.
         if ctx.input(|i| i.modifiers.command && i.modifiers.alt && i.key_pressed(egui::Key::Home)) {
             self.switch_header_source();
@@ -8167,6 +8224,13 @@ impl eframe::App for App {
             ctx.request_repaint_after(std::time::Duration::from_millis(1050));
         }
         for (path, edits, post, typed_here) in edited {
+            // Ctrl+Shift+Backspace: remember where the last change happened. Recorded from the
+            // FIRST change of the batch, which is where the user's caret actually was.
+            if let Some((_, tx)) = edits.first() {
+                if let Some(c) = tx.changes.first() {
+                    self.last_edit = Some((path.clone(), c.start));
+                }
+            }
             // Breakpoints ride their code: shift stored lines through each transaction so the
             // dot, the session file, and the adapter all keep pointing at the marked STATEMENT
             // after lines are inserted/deleted above it.
@@ -9015,9 +9079,15 @@ impl eframe::App for App {
             Some(PickAction::OpenFile(file)) => self.open_file(file),
             None => {}
         }
+        // Read the requested line BEFORE ui(), which closes (and clears) the picker on pick.
+        let want_line = self.quickopen.requested_line();
         let picked = self.quickopen.ui(ctx);
         if let Some(path) = picked {
             self.open_file(path);
+            // `main.c:42` positions after opening.
+            if let Some(line) = want_line {
+                self.goto_line_1based(line);
+            }
         }
         // Command palette: draw, and run whatever action was chosen.
         if let Some(cmd) = self.palette.ui(ctx) {
