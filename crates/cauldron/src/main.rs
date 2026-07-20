@@ -40,6 +40,7 @@ mod psi;
 mod quickopen;
 mod runconfig;
 mod runner;
+mod safewrite;
 mod search;
 mod settings;
 mod state;
@@ -1610,7 +1611,7 @@ impl App {
                 return; // lazy stub: writing its empty buffer would TRUNCATE the real file
             }
             let text = f.buffer.rope().to_string();
-            match std::fs::write(&f.path, &text) {
+            match safewrite::write(&f.path, &text) {
                 Ok(()) => {
                     localhist::record(&f.path, &text);
                     f.dirty = false;
@@ -1667,7 +1668,7 @@ impl App {
             .collect();
         let mut ok = true;
         for (path, text) in dirty {
-            match std::fs::write(&path, &text) {
+            match safewrite::write(&path, &text) {
                 Ok(()) => {
                     localhist::record(&path, &text);
                     self.lsp.did_save(&path);
@@ -3558,6 +3559,11 @@ impl App {
                 self.bottom_open = true;
             }
             C::SwitchHeaderSource => self.switch_header_source(),
+            C::ExpandSelection => self.editor_command(ctx, |v, b, _| v.expand_selection(b)),
+            C::ShrinkSelection => self.editor_command(ctx, |v, b, _| v.shrink_selection(b)),
+            C::SortLines => self.editor_command(ctx, |v, b, n| v.sort_lines(b, n, false)),
+            C::DeleteLine => self.editor_command(ctx, |v, b, n| v.delete_lines(b, n)),
+            C::ToggleCase => self.editor_command(ctx, |v, b, n| v.toggle_case(b, n)),
             C::ToggleTerminal => {
                 let root = self.terminal_root();
                 self.terminal.toggle(ctx, &root);
@@ -7326,7 +7332,10 @@ impl eframe::App for App {
                 self.bottom_tab = BottomTab::Problems;
             }
         }
-        if cmd(egui::Key::W) {
+        // Close tab is Ctrl+F4, as in JetBrains — Ctrl+W is Extend Selection there, and the
+        // editor claims it. Both on Ctrl+W would close the tab AND expand, since this global
+        // reads raw context input without checking editor focus.
+        if !shell && ctx.input(|i| i.key_pressed(egui::Key::F4) && !i.modifiers.alt) {
             let (g, a) = (self.focused, self.groups[self.focused].active);
             self.request_close_tab(g, a);
         }

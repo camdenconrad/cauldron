@@ -92,6 +92,13 @@ struct LineGeom {
 }
 
 /// An open buffer's editor: text-engine highlight pipeline + the live selection set.
+/// One caret's Ctrl+W ladder.
+#[derive(Debug, Clone)]
+struct ExpandStack {
+    ranges: Vec<Range<usize>>,
+    at: usize,
+}
+
 /// One pending AI ghost completion.
 struct Ghost {
     byte: usize,
@@ -164,6 +171,11 @@ pub struct EditorView {
     /// AI inline (ghost) completion pinned to a caret byte + buffer generation. Cleared the
     /// moment either drifts. Tab accepts, Esc dismisses.
     ghost: Option<Ghost>,
+    /// Ctrl+W history: `(buffer generation, one range stack per caret)`, innermost first with
+    /// `at` marking the current rung. NOT invalidated from the many caret-moving paths — that
+    /// would be a bug farm. Instead [`Self::expand_valid`] checks that every caret still sits on
+    /// the rung it claims, which any other motion or edit breaks by construction.
+    expand: Option<(u64, Vec<ExpandStack>)>,
     /// A ghost was accepted with Tab this frame; the app must not also let the completion popup
     /// consume that same Tab. Drained by [`Self::take_ghost_accepted`].
     ghost_accepted: bool,
@@ -567,6 +579,7 @@ impl EditorView {
             context_click: None,
             caret_pos: None,
             ghost: None,
+            expand: None,
             ghost_accepted: false,
             blink_epoch: 0.0,
             blink_head: 0,
@@ -1784,6 +1797,149 @@ impl EditorView {
         self.test_click.take()
     }
 
+    /// Ctrl+W. Grow every selection to the next enclosing syntactic range.
+    ///
+    /// The ladder is REMEMBERED rather than recomputed, so Ctrl+Shift+W returns to exactly the
+    /// range you saw rather than whatever a fresh walk would produce for the widened selection.
+    pub fn expand_selection(&mut self, buffer: &mut Buffer) {
+        if !self.expand_valid(buffer) {
+            // Seed one stack per caret at its current range.
+            let stacks = self
+                .selections
+                .ranges
+                .iter()
+                .map(|s| ExpandStack { ranges: vec![s.range()], at: 0 })
+                .collect();
+            self.expand = Some((buffer.generation, stacks));
+        }
+        let rope = buffer.rope().clone();
+        let Some((_, stacks)) = self.expand.as_mut() else { return };
+        let mut moved = false;
+        for (i, st) in stacks.iter_mut().enumerate() {
+            let cur = st.ranges[st.at].clone();
+            // Already-computed rung above? Reuse it, so expand-shrink-expand is stable.
+            if st.at + 1 < st.ranges.len() {
+                st.at += 1;
+                moved = true;
+            } else if let Some(next) = Self::expand_step(self.syntax.as_ref(), self.lang, &rope, cur) {
+                st.ranges.push(next);
+                st.at += 1;
+                moved = true;
+            }
+            let r = st.ranges[st.at].clone();
+            if let Some(sel) = self.selections.ranges.get_mut(i) {
+                *sel = Selection { anchor: r.start, head: r.end, goal_col: None };
+            }
+        }
+        if !moved {
+            return;
+        }
+        let before = self.selections.ranges.len();
+        self.selections.merge_overlaps();
+        if self.selections.ranges.len() != before {
+            // Merged carets have no honest ladder between them; drop it rather than let shrink
+            // walk a stack that no longer corresponds to the selections.
+            self.expand = None;
+        }
+        buffer.seal();
+    }
+
+    /// Ctrl+Shift+W: step back down the remembered ladder. A no-op when there is no live ladder.
+    pub fn shrink_selection(&mut self, buffer: &mut Buffer) {
+        if !self.expand_valid(buffer) {
+            return;
+        }
+        let Some((_, stacks)) = self.expand.as_mut() else { return };
+        for (i, st) in stacks.iter_mut().enumerate() {
+            if st.at == 0 {
+                continue;
+            }
+            st.at -= 1;
+            let r = st.ranges[st.at].clone();
+            if let Some(sel) = self.selections.ranges.get_mut(i) {
+                *sel = Selection { anchor: r.start, head: r.end, goal_col: None };
+            }
+        }
+        buffer.seal();
+    }
+
+    /// Is the remembered ladder still the one describing the live selections? False after any
+    /// edit or any caret movement that did not come from expand/shrink.
+    fn expand_valid(&self, buffer: &Buffer) -> bool {
+        let Some((gen, stacks)) = &self.expand else { return false };
+        *gen == buffer.generation
+            && stacks.len() == self.selections.ranges.len()
+            && stacks
+                .iter()
+                .zip(&self.selections.ranges)
+                .all(|(st, sel)| st.ranges.get(st.at) == Some(&sel.range()))
+    }
+
+    /// One rung up from `cur`.
+    fn expand_step(
+        syntax: Option<&Syntax>,
+        lang: Option<Lang>,
+        rope: &Rope,
+        cur: Range<usize>,
+    ) -> Option<Range<usize>> {
+        // A bare caret starts at the token. Prefer the word to the LEFT when the caret sits just
+        // after one (`foo|(`), which is where it lands after typing an identifier.
+        if cur.is_empty() {
+            let w = selection::word_range(rope, cur.start);
+            if !w.is_empty() {
+                return Some(w);
+            }
+            if cur.start > 0 {
+                let w = selection::word_range(rope, cur.start - 1);
+                if !w.is_empty() {
+                    return Some(w);
+                }
+            }
+        }
+        let bigger = |r: Range<usize>| (r.start < cur.start || r.end > cur.end).then_some(r);
+
+        // Inside a string, the CONTENTS come before the quotes.
+        if let (Some(syn), Some(l)) = (syntax, lang) {
+            if let Some(s) = syn.innermost_of_kind(cur.start, l.string_kinds()) {
+                let inner = inner_span(rope, &s);
+                if cur.start >= inner.start && cur.end <= inner.end {
+                    if let Some(r) = bigger(inner) {
+                        return Some(r);
+                    }
+                }
+                if let Some(r) = bigger(s) {
+                    return Some(r);
+                }
+            }
+        }
+        let Some(syn) = syntax else {
+            // No parse tree (plain text): word -> line -> whole buffer, so Ctrl+W is never dead.
+            let line = selection::line_range(rope, cur.start);
+            return bigger(line).or_else(|| bigger(0..rope.len_bytes()));
+        };
+        let mut range = syn.enclosing_range(cur.clone())?;
+        // A delimited list yields its INTERIOR first, so no rung ever includes one paren but not
+        // the other, and `f(a, b|, c)` steps b -> a, b, c -> (a, b, c).
+        if let Some(l) = lang {
+            let node_is_list = syn
+                .innermost_of_kind(cur.start, l.list_kinds())
+                .is_some_and(|r| r == range);
+            if node_is_list {
+                let inner = inner_span(rope, &range);
+                if let Some(r) = bigger(inner) {
+                    return Some(r);
+                }
+            }
+        }
+        // Climb until something is genuinely bigger.
+        loop {
+            if let Some(r) = bigger(range.clone()) {
+                return Some(r);
+            }
+            range = syn.enclosing_range(range)?;
+        }
+    }
+
     /// Install an AI ghost completion (shown dimmed at the caret; Tab accepts).
     pub fn set_ghost(&mut self, byte: usize, generation: u64, text: String) {
         if !text.is_empty() {
@@ -1992,7 +2148,13 @@ impl EditorView {
                     self.undo(buffer);
                 }
             }
-            Key::Y if m.command => self.redo(buffer),
+            // Ctrl+Y = Delete Line (JetBrains). Redo keeps Ctrl+Shift+Z, which this arm merely
+            // duplicated.
+            Key::Y if m.command => self.delete_lines(buffer, now),
+            Key::U if m.command && m.shift => self.toggle_case(buffer, now),
+            Key::W if m.command && m.shift => self.shrink_selection(buffer),
+            Key::W if m.command => self.expand_selection(buffer),
+            Key::G if m.alt && m.shift => self.carets_to_line_ends(buffer),
             Key::D if m.command => self.duplicate_lines(buffer, now),
             // Ctrl+/ toggle line comment, Ctrl+Shift+/ toggle block comment, Ctrl+Shift+J join.
             Key::Slash if m.command && m.shift => self.toggle_block_comment(buffer, now),
@@ -2206,11 +2368,26 @@ impl EditorView {
         } else {
             EditKind::DeleteBack
         };
-        self.apply_edits(buffer, kind, now, |sel, rope| {
+        let soft_tab = !forward && !word;
+        self.apply_edits(buffer, kind, now, move |sel, rope| {
             if !sel.is_empty() {
                 return (sel.range(), String::new());
             }
             let h = sel.head;
+            // Backspace inside the LEADING whitespace removes a whole indent unit, so one press
+            // undoes one Tab instead of leaving the caret stranded mid-indent. Only when
+            // everything to the left is whitespace — after real code, backspace is per-character.
+            if soft_tab && h > 0 {
+                let line = rope.byte_to_line(h);
+                let ls = rope.line_to_byte(line);
+                let col = h - ls;
+                if col > 0 && col % TAB.len() == 0 {
+                    let head: String = rope.byte_slice(ls..h).into();
+                    if head.chars().all(|c| c == ' ') {
+                        return (h - TAB.len()..h, String::new());
+                    }
+                }
+            }
             let range = match (forward, word) {
                 (false, false) => selection::prev_grapheme(rope, h)..h,
                 (true, false) => h..selection::next_grapheme(rope, h),
@@ -2225,6 +2402,133 @@ impl EditorView {
     /// duplicate it ONCE (JetBrains behavior) — the first caret to reach a line claims it; the
     /// rest yield a zero-effect edit that apply_edits filters out (their carets still ride the
     /// insertion delta).
+    /// Ctrl+Y: delete the whole line(s) the carets sit on, leaving the caret at the same column
+    /// on what is now that line. Distinct from a selection delete — no selection is required, and
+    /// the line's newline goes with it so the file does not accumulate blanks.
+    pub fn delete_lines(&mut self, buffer: &mut Buffer, now: f64) {
+        let claimed = std::cell::RefCell::new(std::collections::HashSet::new());
+        self.apply_edits(buffer, EditKind::Other, now, |sel, rope| {
+            // A selection spanning several lines deletes all of them; a bare caret deletes one.
+            let r = sel.range();
+            let first = rope.byte_to_line(r.start);
+            let last = rope.byte_to_line(r.end);
+            if !claimed.borrow_mut().insert(first) {
+                return (r.start..r.start, String::new()); // another caret owns this line
+            }
+            let start = rope.line_to_byte(first);
+            let end = match last + 1 < rope.len_lines() {
+                true => rope.line_to_byte(last + 1),
+                // Last line with no trailing newline: take the preceding newline instead, or the
+                // file would keep a stray empty line forever.
+                false => rope.len_bytes(),
+            };
+            let start = match end == rope.len_bytes() && start > 0 {
+                true => start - 1,
+                false => start,
+            };
+            (start..end, String::new())
+        });
+    }
+
+    /// Ctrl+Shift+U: lower -> UPPER -> lower on the selection, or on the word under a bare caret.
+    /// The direction is decided ONCE for the whole edit from the first affected text, so a mixed
+    /// selection flips as a unit rather than each caret disagreeing.
+    pub fn toggle_case(&mut self, buffer: &mut Buffer, now: f64) {
+        let rope = buffer.rope();
+        let target = |sel: &Selection, rope: &Rope| -> Range<usize> {
+            match sel.is_empty() {
+                true => selection::word_range(rope, sel.head),
+                false => sel.range(),
+            }
+        };
+        // "Has any lowercase" -> uppercase it; otherwise lowercase. Matches the intuition that
+        // the first press on ordinary code SHOUTS, and the second press undoes it.
+        let to_upper = self
+            .selections
+            .ranges
+            .iter()
+            .map(|s| target(s, rope))
+            .any(|r| rope.byte_slice(r).chars().any(char::is_lowercase));
+        self.apply_edits(buffer, EditKind::Other, now, move |sel, rope| {
+            let r = target(sel, rope);
+            let text: String = rope.byte_slice(r.clone()).into();
+            let out = match to_upper {
+                true => text.to_uppercase(),
+                false => text.to_lowercase(),
+            };
+            (r, out)
+        });
+    }
+
+    /// Sort the lines spanned by the selection alphabetically (byte order, stable). A bare caret
+    /// sorts nothing — sorting the whole file from a stray keystroke would be catastrophic and
+    /// hard to notice.
+    pub fn sort_lines(&mut self, buffer: &mut Buffer, now: f64, reverse: bool) {
+        let rope = buffer.rope();
+        let Some(sel) = self.selections.ranges.iter().find(|s| !s.is_empty()) else { return };
+        let r = sel.range();
+        let first = rope.byte_to_line(r.start);
+        let mut last = rope.byte_to_line(r.end);
+        // A selection ending at column 0 does not include that line (same rule as indent_lines).
+        if last > first && rope.line_to_byte(last) == r.end {
+            last -= 1;
+        }
+        if last <= first {
+            return; // one line is already sorted
+        }
+        let start = rope.line_to_byte(first);
+        let end = match last + 1 < rope.len_lines() {
+            true => rope.line_to_byte(last + 1),
+            false => rope.len_bytes(),
+        };
+        let block: String = rope.byte_slice(start..end).into();
+        let had_trailing_newline = block.ends_with('\n');
+        let mut lines: Vec<&str> = block.lines().collect();
+        lines.sort();
+        if reverse {
+            lines.reverse();
+        }
+        let mut out = lines.join("\n");
+        if had_trailing_newline {
+            out.push('\n');
+        }
+        self.apply_edits(buffer, EditKind::Other, now, move |_, _| (start..end, out.clone()));
+    }
+
+    /// Alt+Shift+G: put a caret at the end of every line the selection spans, then drop the
+    /// selection. The fastest way into a column edit over a block.
+    pub fn carets_to_line_ends(&mut self, buffer: &mut Buffer) {
+        let rope = buffer.rope();
+        let mut lines = std::collections::BTreeSet::new();
+        for sel in &self.selections.ranges {
+            let r = sel.range();
+            let first = rope.byte_to_line(r.start);
+            let mut last = rope.byte_to_line(r.end);
+            if last > first && rope.line_to_byte(last) == r.end {
+                last -= 1;
+            }
+            for l in first..=last {
+                lines.insert(l);
+            }
+        }
+        if lines.len() < 2 {
+            return; // one line: nothing multi-caret about it
+        }
+        let ranges: Vec<Selection> = lines
+            .into_iter()
+            .map(|l| {
+                let start = rope.line_to_byte(l);
+                let len = rope.line(l).len_bytes();
+                let text: String = rope.line(l).into();
+                // Land BEFORE the newline, not after it.
+                let trimmed = text.trim_end_matches(['\n', '\r']).len();
+                Selection::at(start + trimmed.min(len))
+            })
+            .collect();
+        self.selections = Selections { primary: ranges.len() - 1, ranges };
+        buffer.seal();
+    }
+
     fn duplicate_lines(&mut self, buffer: &mut Buffer, now: f64) {
         let claimed = std::cell::RefCell::new(std::collections::HashSet::new());
         self.apply_edits(buffer, EditKind::Duplicate, now, |sel, rope| {
@@ -3640,6 +3944,24 @@ fn block_comment_continuation(code_line: &str, lang: Option<Lang>) -> Option<&'s
     t.starts_with('*').then_some("* ")
 }
 
+/// The span strictly between a delimited node's first and last character, trimmed of the
+/// whitespace that follows an opening brace and precedes a closing one — selecting a block body
+/// should not drag in the newline and indent that merely position it.
+fn inner_span(rope: &Rope, outer: &Range<usize>) -> Range<usize> {
+    if outer.end.saturating_sub(outer.start) < 2 {
+        return outer.clone();
+    }
+    let mut s = outer.start + 1;
+    let mut e = outer.end - 1;
+    while s < e && rope.byte_slice(s..s + 1).chars().next().is_some_and(char::is_whitespace) {
+        s += 1;
+    }
+    while e > s && rope.byte_slice(e - 1..e).chars().next().is_some_and(char::is_whitespace) {
+        e -= 1;
+    }
+    s..e
+}
+
 fn leading_ws(rope: &Rope, byte: usize) -> String {
     let line = rope.byte_to_line(byte);
     let mut out = String::new();
@@ -4315,6 +4637,193 @@ mod tests {
         v.typed_char(&mut b, '}', 0.0);
         // Either the pair logic or nothing handled it, but the leading indent must survive.
         assert!(b.rope().to_string().starts_with("    x();"), "{}", b.rope());
+    }
+
+    fn sel_text(v: &EditorView, b: &Buffer) -> String {
+        let r = v.selections.primary().range();
+        b.rope().byte_slice(r).into()
+    }
+
+    #[test]
+    fn expand_grows_token_then_call_then_statement() {
+        let (mut v, mut b) = setup("void f(void) { g(aa, bb); }\n");
+        let at = b.rope().to_string().find("aa").unwrap();
+        v.selections = Selections::single(at + 1);
+        v.expand_selection(&mut b);
+        assert_eq!(sel_text(&v, &b), "aa", "first press takes the token");
+        let mut seen = vec![sel_text(&v, &b)];
+        for _ in 0..4 {
+            v.expand_selection(&mut b);
+            seen.push(sel_text(&v, &b));
+        }
+        // Each rung must strictly contain the previous one.
+        for w in seen.windows(2) {
+            assert!(w[1].len() > w[0].len(), "rung did not grow: {:?} -> {:?}", w[0], w[1]);
+        }
+        assert!(seen.iter().any(|s| s == "aa, bb"), "list interior expected: {seen:?}");
+        assert!(seen.iter().any(|s| s.contains("g(aa, bb)")), "call expected: {seen:?}");
+    }
+
+    #[test]
+    fn shrink_returns_the_exact_previous_range() {
+        let (mut v, mut b) = setup("void f(void) { g(aa, bb); }\n");
+        let at = b.rope().to_string().find("bb").unwrap();
+        v.selections = Selections::single(at + 1);
+        v.expand_selection(&mut b);
+        v.expand_selection(&mut b);
+        let two = sel_text(&v, &b);
+        v.expand_selection(&mut b);
+        v.shrink_selection(&mut b);
+        assert_eq!(sel_text(&v, &b), two, "shrink must retrace, not recompute");
+    }
+
+    #[test]
+    fn moving_the_caret_discards_the_ladder() {
+        let (mut v, mut b) = setup("void f(void) { g(aa, bb); }\n");
+        let at = b.rope().to_string().find("aa").unwrap();
+        v.selections = Selections::single(at + 1);
+        v.expand_selection(&mut b);
+        v.expand_selection(&mut b);
+        v.selections = Selections::single(at); // any other motion
+        v.shrink_selection(&mut b);
+        assert!(v.selections.primary().is_empty(), "a stale ladder must not resurrect a selection");
+        v.expand_selection(&mut b);
+        assert_eq!(sel_text(&v, &b), "aa", "the next expand starts fresh at the token");
+    }
+
+    #[test]
+    fn editing_discards_the_ladder() {
+        let (mut v, mut b) = setup("void f(void) { g(aa, bb); }\n");
+        let at = b.rope().to_string().find("aa").unwrap();
+        v.selections = Selections::single(at + 1);
+        v.expand_selection(&mut b);
+        v.expand_selection(&mut b);
+        v.selections = Selections::single(at + 1);
+        v.insert(&mut b, "x", EditKind::InsertText, 0.0);
+        v.shrink_selection(&mut b);
+        assert!(v.selections.primary().is_empty());
+    }
+
+    #[test]
+    fn expand_inside_a_string_takes_the_contents_before_the_quotes() {
+        let (mut v, mut b) = setup("void f(void) { puts(\"abc\"); }\n");
+        let at = b.rope().to_string().find("abc").unwrap();
+        v.selections = Selections::single(at + 1);
+        v.expand_selection(&mut b);
+        assert_eq!(sel_text(&v, &b), "abc");
+        v.expand_selection(&mut b);
+        assert_eq!(sel_text(&v, &b), "\"abc\"", "then the quotes come in");
+    }
+
+    #[test]
+    fn expand_is_never_a_dead_key_without_a_parse_tree() {
+        // A plain-text buffer has no Syntax; Ctrl+W must still do something sensible.
+        let buffer = Buffer::from_text("hello world\nsecond line\n");
+        let mut v = EditorView::new(&buffer, "notes.txt");
+        let mut b = buffer;
+        v.selections = Selections::single(2);
+        v.expand_selection(&mut b);
+        assert_eq!(sel_text(&v, &b), "hello");
+        v.expand_selection(&mut b);
+        assert!(sel_text(&v, &b).starts_with("hello world"), "then the line");
+    }
+
+    #[test]
+    fn expand_at_the_root_stops_instead_of_looping() {
+        let (mut v, mut b) = setup("int x;\n");
+        v.selections = Selections::single(4);
+        for _ in 0..12 {
+            v.expand_selection(&mut b);
+        }
+        let r = v.selections.primary().range();
+        assert!(r.end <= b.rope().len_bytes(), "must not run past the buffer");
+    }
+
+    #[test]
+    fn delete_line_removes_the_whole_line_including_its_newline() {
+        let (mut v, mut b) = setup("one\ntwo\nthree\n");
+        v.selections = Selections::single(5); // on "two"
+        v.delete_lines(&mut b, 0.0);
+        assert_eq!(b.rope().to_string(), "one\nthree\n");
+    }
+
+    #[test]
+    fn delete_last_line_takes_the_preceding_newline() {
+        // Otherwise the file keeps a stray empty line that nothing can remove.
+        let (mut v, mut b) = setup("one\ntwo");
+        v.selections = Selections::single(5);
+        v.delete_lines(&mut b, 0.0);
+        assert_eq!(b.rope().to_string(), "one");
+    }
+
+    #[test]
+    fn toggle_case_uppercases_then_lowercases() {
+        let (mut v, mut b) = setup("hello world");
+        v.selections = Selections { ranges: vec![Selection { anchor: 0, head: 5, goal_col: None }], primary: 0 };
+        v.toggle_case(&mut b, 0.0);
+        assert_eq!(b.rope().to_string(), "HELLO world");
+        v.selections = Selections { ranges: vec![Selection { anchor: 0, head: 5, goal_col: None }], primary: 0 };
+        v.toggle_case(&mut b, 0.0);
+        assert_eq!(b.rope().to_string(), "hello world");
+    }
+
+    #[test]
+    fn toggle_case_on_a_bare_caret_takes_the_word() {
+        let (mut v, mut b) = setup("int value = 1;");
+        v.selections = Selections::single(6); // inside "value"
+        v.toggle_case(&mut b, 0.0);
+        assert_eq!(b.rope().to_string(), "int VALUE = 1;");
+    }
+
+    #[test]
+    fn sort_lines_orders_the_selected_block_only() {
+        let (mut v, mut b) = setup("keep\nc\na\nb\ntail\n");
+        // Select the three middle lines.
+        v.selections = Selections { ranges: vec![Selection { anchor: 5, head: 11, goal_col: None }], primary: 0 };
+        v.sort_lines(&mut b, 0.0, false);
+        assert_eq!(b.rope().to_string(), "keep\na\nb\nc\ntail\n");
+    }
+
+    #[test]
+    fn sort_lines_does_nothing_without_a_selection() {
+        // A stray keystroke must never reorder the whole file.
+        let (mut v, mut b) = setup("c\na\nb\n");
+        v.selections = Selections::single(0);
+        v.sort_lines(&mut b, 0.0, false);
+        assert_eq!(b.rope().to_string(), "c\na\nb\n");
+    }
+
+    #[test]
+    fn carets_to_line_ends_lands_before_each_newline() {
+        let (mut v, mut b) = setup("aa\nbbbb\ncc\n");
+        v.selections = Selections { ranges: vec![Selection { anchor: 0, head: 10, goal_col: None }], primary: 0 };
+        v.carets_to_line_ends(&mut b);
+        assert_eq!(carets(&v), vec![2, 7, 10]);
+    }
+
+    #[test]
+    fn backspace_in_leading_whitespace_removes_a_whole_indent() {
+        let (mut v, mut b) = setup("        x");
+        v.selections = Selections::single(8); // right before `x`
+        v.delete_side(&mut b, false, false, 0.0);
+        assert_eq!(b.rope().to_string(), "    x", "one press undoes one Tab");
+    }
+
+    #[test]
+    fn backspace_after_code_is_still_one_character() {
+        let (mut v, mut b) = setup("    ab");
+        v.selections = Selections::single(6);
+        v.delete_side(&mut b, false, false, 0.0);
+        assert_eq!(b.rope().to_string(), "    a");
+    }
+
+    #[test]
+    fn backspace_off_an_indent_boundary_is_one_character() {
+        // Hand-aligned text (3 spaces) must not jump a full unit.
+        let (mut v, mut b) = setup("   x");
+        v.selections = Selections::single(3);
+        v.delete_side(&mut b, false, false, 0.0);
+        assert_eq!(b.rope().to_string(), "  x");
     }
 
     #[test]

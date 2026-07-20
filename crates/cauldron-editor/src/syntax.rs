@@ -5,6 +5,8 @@
 //! keystroke reparses only the damaged region — this is what keeps Gate A's CPU budget honest on
 //! a 5k-line cFS file.
 
+use std::ops::Range;
+
 use ropey::Rope;
 use tree_sitter::{InputEdit, Language, Parser, Point as TsPoint, Tree};
 
@@ -62,6 +64,30 @@ impl Lang {
             Lang::Json => Some("//"),
             Lang::Yaml => Some("#"),
             Lang::Css | Lang::Html => None,
+        }
+    }
+
+    /// Node kinds whose CONTENTS (between the delimiters) are a meaningful selection step, so
+    /// Ctrl+W inside a string selects the text before the quotes.
+    pub fn string_kinds(self) -> &'static [&'static str] {
+        match self {
+            Lang::Rust => &["string_literal", "raw_string_literal", "char_literal"],
+            Lang::C | Lang::Cpp => &["string_literal", "char_literal"],
+            Lang::Python => &["string"],
+            Lang::Js | Lang::Ts | Lang::Tsx => &["string", "template_string"],
+            _ => &["string", "string_literal"],
+        }
+    }
+
+    /// Delimited lists whose INTERIOR is an intermediate step, so a selection never stops on a
+    /// range that includes the opening paren but not the closing one.
+    pub fn list_kinds(self) -> &'static [&'static str] {
+        match self {
+            Lang::Rust => &["arguments", "parameters", "field_declaration_list", "tuple_expression"],
+            Lang::C | Lang::Cpp => &["argument_list", "parameter_list", "initializer_list"],
+            Lang::Python => &["argument_list", "parameters", "list", "tuple", "dictionary"],
+            Lang::Js | Lang::Ts | Lang::Tsx => &["arguments", "formal_parameters", "array", "object"],
+            _ => &["argument_list", "arguments", "parameter_list"],
         }
     }
 
@@ -181,6 +207,35 @@ impl Syntax {
     /// transaction shrinks the buffer (two-caret backspace, block unindent — the naive pre-edit
     /// offsets would index past the post-edit rope and panic).
     /// Scope chain (outermost → innermost) enclosing `byte` — breadcrumbs + sticky headers.
+    /// The smallest syntax node that STRICTLY contains `range` on at least one side — one rung of
+    /// Ctrl+W. Ancestors whose span equals `range` are skipped: several grammars wrap a node in a
+    /// same-extent parent, and stopping there would make the keystroke look dead.
+    pub fn enclosing_range(&self, range: Range<usize>) -> Option<Range<usize>> {
+        let mut cur = self
+            .tree
+            .root_node()
+            .named_descendant_for_byte_range(range.start, range.end.max(range.start))?;
+        loop {
+            let r = cur.start_byte()..cur.end_byte();
+            if r.start < range.start || r.end > range.end {
+                return Some(r);
+            }
+            cur = cur.parent()?;
+        }
+    }
+
+    /// The innermost node at `byte` whose kind is one of `kinds`, as a byte range.
+    pub fn innermost_of_kind(&self, byte: usize, kinds: &[&str]) -> Option<Range<usize>> {
+        let mut cur = self.tree.root_node().named_descendant_for_byte_range(byte, byte);
+        while let Some(n) = cur {
+            if kinds.contains(&n.kind()) {
+                return Some(n.start_byte()..n.end_byte());
+            }
+            cur = n.parent();
+        }
+        None
+    }
+
     pub fn scopes_at(&self, rope: &Rope, byte: usize) -> Vec<ScopeCrumb> {
         let mut out = Vec::new();
         // Walk up from the deepest node at `byte`, collecting scope-forming ancestors.
@@ -277,7 +332,9 @@ fn scope_name(node: tree_sitter::Node, rope: &Rope) -> Option<String> {
 #[cfg(test)]
 mod scope_tests {
     use super::*;
-    use ropey::Rope;
+    use std::ops::Range;
+
+use ropey::Rope;
 
     fn scopes(lang: Lang, src: &str, at: &str) -> Vec<String> {
         let rope = Rope::from_str(src);
