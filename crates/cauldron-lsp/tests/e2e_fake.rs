@@ -61,7 +61,7 @@ fn code_actions_end_to_end_via_fake_server() {
     // --- request code actions for the `oops` token's byte range ------------------------------
     let rope = Rope::from_str(src);
     let start = src.find("oops").unwrap();
-    lsp.request_code_actions(&main_c, &rope, start..start + 4, 7);
+    lsp.request_code_actions(&main_c, &rope, start..start + 4, &[], 7);
 
     let ev = pump_until(&mut lsp, Duration::from_secs(10), |ev| {
         matches!(ev, LspEvent::CodeActions { .. })

@@ -134,6 +134,10 @@ pub struct EditorView {
     /// Byte offset under the mouse this frame (None when the pointer is off the text). The app
     /// uses it for LSP hover ("code lens" popups).
     hover_byte: Option<usize>,
+    /// Screen rect of the TEXT ROW under the mouse this frame. The app anchors the hover popup
+    /// below this rather than beside the pointer, so the tooltip clears the line it describes
+    /// instead of sitting on top of it.
+    hover_row_rect: Option<egui::Rect>,
     /// Minimap line model, rebuilt lazily per buffer generation.
     mini: MiniModel,
     /// Minimap width (drag its left edge to resize).
@@ -553,6 +557,7 @@ impl EditorView {
                 ))
             },
             hover_byte: None,
+            hover_row_rect: None,
             mini: MiniModel::default(),
             mini_w: 84.0,
             ctrl_click: None,
@@ -1181,14 +1186,22 @@ impl EditorView {
             }
 
             // Hover byte for the app's LSP hover popup (works without focus).
-            self.hover_byte = ui
+            let hover_pt = ui
                 .input(|i| i.pointer.hover_pos())
-                .filter(|p| ui.clip_rect().contains(*p))
-                .map(|p| {
-                    let row = ((p.y - origin.y) / row_h).floor() as usize;
-                    let line = self.row_to_line(row, total);
-                    self.byte_at(&geoms, rope, line, p, text_left)
-                });
+                .filter(|p| ui.clip_rect().contains(*p));
+            self.hover_byte = hover_pt.map(|p| {
+                let row = ((p.y - origin.y) / row_h).floor() as usize;
+                let line = self.row_to_line(row, total);
+                self.byte_at(&geoms, rope, line, p, text_left)
+            });
+            self.hover_row_rect = hover_pt.map(|p| {
+                let row = ((p.y - origin.y) / row_h).floor();
+                let top = origin.y + row * row_h;
+                egui::Rect::from_min_max(
+                    egui::pos2(p.x, top),
+                    egui::pos2(p.x, top + row_h),
+                )
+            });
             if self.find.open && !self.find.matches.is_empty() {
                 Self::paint_find_matches(&self.find, painter, &geoms, rope, text_left, row_h);
             }
@@ -2594,6 +2607,12 @@ impl EditorView {
     /// Byte offset under the mouse this frame (for the app's LSP hover popup).
     pub fn hovered_byte(&self) -> Option<usize> {
         self.hover_byte
+    }
+
+    /// Screen rect of the row under the mouse (see [`Self::hover_row_rect`]) — the hover popup's
+    /// anchor. Zero-width: only the x of the pointer and the row's vertical extent are meaningful.
+    pub fn hovered_row_rect(&self) -> Option<egui::Rect> {
+        self.hover_row_rect
     }
 
     /// Primary caret byte offset (session persistence).

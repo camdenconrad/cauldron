@@ -649,6 +649,10 @@ struct App {
     repaint: cauldron_lsp::Notifier,
     lsp: LspManager,
     diags: DiagStore,
+    /// Raw server diagnostics per path, `[push, pull]` — the exact objects to echo back in a
+    /// code-action `context`. Parallel to the first two layers of [`Self::diags`], which holds a
+    /// view-space form that has already lost the fields a server needs to recognise its own.
+    raw_diags: std::collections::HashMap<PathBuf, [Vec<lsp_types::Diagnostic>; 2]>,
     lsp_message: Option<String>,
     runner: Runner,
     terminal: TerminalPane,
@@ -743,7 +747,10 @@ struct App {
     /// Periodic session autosave clock (on_exit never fires on SIGTERM/kill — see save cadence).
     last_session_save: std::time::Instant,
     /// Quick-fix state: generation we asked codeActions for + the received menu.
-    fix_request_gen: Option<u64>,
+    /// The in-flight code-action request as `(path, buffer generation)`. The path is load-bearing:
+    /// two open buffers routinely share a generation (both 0 right after load), and matching on the
+    /// generation alone let file A's response open a menu that applied against file B.
+    fix_request_gen: Option<(PathBuf, u64)>,
     fix_menu: Option<(egui::Pos2, PathBuf, Vec<lsp_types::CodeActionOrCommand>)>,
     /// Heading for `fix_menu` — the same popup serves Quick Fixes and Refactor This.
     fix_menu_title: &'static str,
@@ -903,7 +910,11 @@ struct App {
     standards: Standards,
     /// LSP hover ("code lens") state: (path, byte, since_secs, requested) + the shown popup.
     hover_wait: Option<(PathBuf, usize, f64, bool)>,
-    hover_popup: Option<(egui::Pos2, String)>,
+    /// The live hover tooltip: the ROW RECT it hangs off, and its markdown text.
+    hover_popup: Option<(egui::Rect, String)>,
+    /// Row rect captured when the hover request was SENT, so the popup lands on the symbol the
+    /// user pointed at rather than wherever the mouse ended up by the time the server answered.
+    hover_anchor: Option<egui::Rect>,
 }
 
 impl App {
@@ -977,6 +988,7 @@ impl App {
             dbg_eval: String::new(),
             dbg_pick: Vec::new(),
             diags: DiagStore::default(),
+            raw_diags: std::collections::HashMap::new(),
             lsp_message: None,
             runner: Runner::default(),
             terminal: TerminalPane::new(),
@@ -1083,6 +1095,7 @@ impl App {
             standards: prefs.standards,
             hover_wait: None,
             hover_popup: None,
+            hover_anchor: None,
         };
         if app.no_project {
             // Nothing to walk/restore — surface the picker (recents listed first) as the
@@ -3677,19 +3690,39 @@ impl App {
                 None
             }
             LspEvent::CodeActions { generation, path, actions } => {
-                if self.fix_request_gen == Some(generation) {
+                if self.fix_request_gen.as_ref() == Some(&(path.clone(), generation)) {
                     self.fix_request_gen = None;
                     self.lsp_message = None;
                     let refactor = self.fix_request_refactor;
                     self.fix_menu_title = if refactor { "Refactor This" } else { "Quick Fixes" };
-                    if actions.is_empty() {
-                        self.lsp_message = Some(if refactor {
-                            "no refactorings available here".into()
-                        } else {
-                            "no quick fixes available here".into()
-                        });
-                    } else if let Some(pos) = ctx_pointer_pos() {
-                        self.fix_menu = Some((pos, path, sort_actions_by_kind(actions)));
+                    // Refactor This filters HERE rather than via the request's `only`: an action
+                    // the server left untagged is kept, where a server-side filter would have
+                    // dropped it (see request_refactorings).
+                    let actions: Vec<_> = match refactor {
+                        true => actions
+                            .into_iter()
+                            .filter(|a| action_group(a) != "Quick Fix")
+                            .collect(),
+                        false => actions,
+                    };
+                    // Refactor This always has a menu to show — Rename and Change Signature are
+                    // ours, not the server's, and stay available with zero server actions.
+                    if actions.is_empty() && !refactor {
+                        self.lsp_message = Some("no quick fixes available here".into());
+                    } else {
+                        // Anchor at the CARET, falling back to the pointer. Alt+Enter is a keyboard
+                        // action; anchoring it to the mouse put the menu wherever the pointer
+                        // happened to sit, and dropped it entirely when the pointer was outside the
+                        // window — actions arrived and nothing appeared at all.
+                        let anchor = self
+                            .groups
+                            .get_mut(self.focused)
+                            .and_then(|g| g.files.get_mut(g.active))
+                            .and_then(|f| f.view.caret_screen_pos())
+                            .map(|p| egui::pos2(p.x, p.y + 18.0))
+                            .or_else(ctx_pointer_pos)
+                            .unwrap_or(egui::pos2(200.0, 200.0));
+                        self.fix_menu = Some((anchor, path, sort_actions_by_kind(actions)));
                     }
                 }
                 None
@@ -4040,14 +4073,18 @@ impl App {
                 None
             }
             LspEvent::Hover { generation, contents } => {
-                // Show only if the buffer hasn't changed since the request and the pointer is
-                // still parked where we asked.
+                // Show only if the buffer hasn't changed since the request. The anchor is the row
+                // the pointer was on WHEN WE ASKED (hover_anchor), not wherever the mouse drifted
+                // to while the server thought — a slow server used to fling the popup across the
+                // screen. Falls back to the live pointer only if no anchor was captured.
                 let g = &self.groups[self.focused];
                 if let (Some(f), Some(h)) = (g.files.get(g.active), contents) {
                     if f.buffer.generation == generation {
                         if let Some(text) = hover_text(&h) {
-                            if let Some(pos) = ctx_pointer_pos() {
-                                self.hover_popup = Some((pos, text));
+                            if let Some(rect) = self.hover_anchor.or_else(|| {
+                                ctx_pointer_pos().map(|p| egui::Rect::from_min_max(p, p))
+                            }) {
+                                self.hover_popup = Some((rect, text));
                             }
                         }
                     }
@@ -4071,6 +4108,12 @@ impl App {
             self.groups.iter().flat_map(|g| g.files.iter()).find(|f| f.path == path && f.loaded)?;
         let converted = to_view_diags(&diags, f.buffer.rope(), enc);
         self.diags.replace(path, layer, converted);
+        // Keep the RAW diagnostics for the two LSP layers. `textDocument/codeAction` has to echo
+        // the server's own diagnostic objects back in `context.diagnostics` — clangd matches them
+        // by identity to decide which fixes to offer, so a lossy ViewDiag cannot stand in.
+        if layer < 2 {
+            self.raw_diags.entry(path.to_path_buf()).or_default()[layer] = diags;
+        }
         Some(path.to_path_buf())
     }
 
@@ -5291,16 +5334,62 @@ impl App {
         self.right_tab = RightTab::Ai;
     }
 
+    /// The server's own diagnostics on `path` that overlap `range`, in LSP terms. These are what
+    /// `context.diagnostics` must carry; without them clangd offers no quickfixes at all.
+    ///
+    /// An EMPTY `range` (the caret, from Alt+Enter) is treated as touching a diagnostic whose span
+    /// contains it, endpoints included — a caret sitting just past the last character of a squiggle
+    /// is still "on" that error as far as the user is concerned.
+    fn diags_overlapping(
+        &self,
+        path: &Path,
+        range: &std::ops::Range<usize>,
+        rope: &Rope,
+    ) -> Vec<lsp_types::Diagnostic> {
+        let Some(layers) = self.raw_diags.get(path) else { return Vec::new() };
+        let enc = self.lsp_encoding(path);
+        layers
+            .iter()
+            .flatten()
+            .filter(|d| {
+                let s = pos_to_byte(rope, &d.range.start, enc);
+                let e = pos_to_byte(rope, &d.range.end, enc).max(s);
+                range.start <= e && s <= range.end
+            })
+            .cloned()
+            .collect()
+    }
+
     /// Ask the file's language server for code actions covering `range`.
+    ///
+    /// When `range` is empty (Alt+Enter at the caret) it is WIDENED to span the diagnostics it
+    /// touches. Servers that require the requested range to overlap a diagnostic returned nothing
+    /// when the caret sat one column off the squiggle, which read as "quick fixes don't work".
     fn request_quick_fixes(&mut self, path: PathBuf, range: std::ops::Range<usize>) {
         if let Some(f) =
             self.groups.iter().flat_map(|g| g.files.iter()).find(|f| f.path == path && f.loaded)
         {
             let gen = f.buffer.generation;
             let rope = f.buffer.rope().clone();
-            self.fix_request_gen = Some(gen);
+            let diags = self.diags_overlapping(&path, &range, &rope);
+            let mut range = range;
+            if range.is_empty() {
+                let enc = self.lsp_encoding(&path);
+                for d in &diags {
+                    let s = pos_to_byte(&rope, &d.range.start, enc);
+                    let e = pos_to_byte(&rope, &d.range.end, enc).max(s);
+                    range.start = range.start.min(s);
+                    range.end = range.end.max(e);
+                }
+                // Still empty — no diagnostic here at all. Widen to the identifier under the
+                // caret so a caret-only request can still surface refactorings.
+                if range.is_empty() {
+                    range = word_range_at(&rope, range.start);
+                }
+            }
+            self.fix_request_gen = Some((path.clone(), gen));
             self.fix_request_refactor = false;
-            self.lsp.request_code_actions(&path, &rope, range, gen);
+            self.lsp.request_code_actions(&path, &rope, range, &diags, gen);
             self.lsp_message = Some("fetching quick fixes…".into());
         }
     }
@@ -5583,15 +5672,19 @@ impl App {
         };
         let gen = f.buffer.generation;
         let rope = f.buffer.rope().clone();
-        self.fix_request_gen = Some(gen);
+        self.fix_request_gen = Some((path.clone(), gen));
         self.fix_request_refactor = true;
-        self.lsp.request_code_actions_only(
-            &path,
-            &rope,
-            range,
-            &["refactor", "source"],
-            gen,
-        );
+        // No server-side `only` filter. Kind tagging is inconsistent in practice — servers that
+        // return untagged actions answered an `only: ["refactor","source"]` request with nothing,
+        // leaving Refactor This permanently empty. Ask for everything and drop quickfixes on the
+        // way into the menu instead, where an untagged action is kept rather than lost.
+        let diags = self.diags_overlapping(&path, &range, &rope);
+        // Same empty-caret widening as quick fixes — an empty range yields no actions at all.
+        let range = match range.is_empty() {
+            true => word_range_at(&rope, range.start),
+            false => range,
+        };
+        self.lsp.request_code_actions_only(&path, &rope, range, &[], &diags, gen);
         self.lsp_message = Some("finding refactorings…".into());
     }
 
@@ -8586,6 +8679,12 @@ impl eframe::App for App {
                         {
                             let gen = f.buffer.generation;
                             let rope = f.buffer.rope().clone();
+                            // Freeze the anchor now — see hover_anchor.
+                            self.hover_anchor = self
+                                .groups
+                                .get(self.focused)
+                                .and_then(|g| g.files.get(g.active))
+                                .and_then(|f| f.view.hovered_row_rect());
                             self.lsp.request_hover(&p, &rope, b, gen);
                         }
                     }
@@ -8594,6 +8693,7 @@ impl eframe::App for App {
             None => {
                 self.hover_wait = None;
                 self.hover_popup = None;
+                self.hover_anchor = None;
             }
         }
         if let Some((pos, path, actions)) = self.fix_menu.clone() {
@@ -8677,19 +8777,27 @@ impl eframe::App for App {
         if ctx.input(|i| i.pointer.any_pressed()) {
             self.hover_popup = None;
         }
-        if let Some((pos, text)) = &self.hover_popup {
-            egui::Area::new("lsp-hover".into())
-                .fixed_pos(*pos + egui::vec2(12.0, 14.0))
+        if let Some((row, text)) = self.hover_popup.clone() {
+            // Hang the popup BELOW the hovered row, flipping above it when there is no room. The
+            // old anchor was pointer + (12,14), which lands inside the next line of text -- the
+            // tooltip sat on top of the code it was describing.
+            let screen = ctx.screen_rect();
+            let below = row.max.y + 4.0;
+            let flip = below + 220.0 > screen.max.y && row.min.y - 4.0 > screen.height() * 0.4;
+            let anchor = egui::pos2(row.min.x.min(screen.max.x - 570.0).max(screen.min.x + 4.0), below);
+            let mut area = egui::Area::new("lsp-hover".into())
                 .order(egui::Order::Tooltip)
-                .interactable(false)
-                .show(ctx, |ui| {
-                    egui::Frame::popup(ui.style()).show(ui, |ui| {
-                        ui.set_max_width(560.0);
-                        ui.label(
-                            egui::RichText::new(text).size(12.0).monospace().color(colors::TEXT()),
-                        );
-                    });
+                .interactable(false);
+            area = match flip {
+                true => area.fixed_pos(egui::pos2(anchor.x, row.min.y - 4.0)).pivot(egui::Align2::LEFT_BOTTOM),
+                false => area.fixed_pos(anchor),
+            };
+            area.show(ctx, |ui| {
+                egui::Frame::popup(ui.style()).show(ui, |ui| {
+                    ui.set_max_width(560.0);
+                    hover_markdown_ui(ui, &text);
                 });
+            });
         }
 
         // --- goto line (Ctrl+G) -----------------------------------------------------------------
@@ -9910,17 +10018,113 @@ fn hover_text(h: &lsp_types::Hover) -> Option<String> {
         }
         lsp_types::HoverContents::Markup(m) => m.value.clone(),
     };
-    let cleaned: String = raw
-        .lines()
-        .filter(|l| !l.trim_start().starts_with("```"))
-        .collect::<Vec<_>>()
-        .join("\n");
-    let trimmed = cleaned.trim();
+    // The fences are KEPT: hover_markdown_ui needs them to tell a signature from its prose.
+    // Stripping the fence lines while keeping their bodies (the old behaviour) fused the code and
+    // the docs into one undifferentiated monospace wall.
+    let trimmed = raw.trim();
     if trimmed.is_empty() {
         None
     } else {
         Some(trimmed.chars().take(1600).collect())
     }
+}
+
+/// Render an LSP hover body: fenced blocks as monospace code on a tinted background, everything
+/// else as proportional prose with `**bold**`/`` `code` `` inline spans resolved and `---` drawn
+/// as a real separator. Deliberately a small subset — hovers are signatures and short docs, not
+/// documents, and a full markdown engine would be a dependency for nothing.
+fn hover_markdown_ui(ui: &mut egui::Ui, text: &str) {
+    let mut code: Option<Vec<&str>> = None;
+    let mut prose: Vec<&str> = Vec::new();
+
+    fn flush_prose(ui: &mut egui::Ui, lines: &mut Vec<&str>) {
+        let joined = lines.join("\n");
+        lines.clear();
+        let body = joined.trim();
+        if !body.is_empty() {
+            inline_markdown(ui, body);
+        }
+    }
+
+    for line in text.lines() {
+        let t = line.trim_start();
+        if t.starts_with("```") {
+            match code.take() {
+                // Closing fence: paint what we gathered.
+                Some(buf) => {
+                    let src = buf.join("\n");
+                    if !src.trim().is_empty() {
+                        egui::Frame::none()
+                            .fill(ui.visuals().extreme_bg_color)
+                            .inner_margin(egui::Margin::symmetric(6.0, 4.0))
+                            .rounding(3.0)
+                            .show(ui, |ui| {
+                                ui.label(
+                                    egui::RichText::new(src)
+                                        .size(12.0)
+                                        .monospace()
+                                        .color(colors::TEXT()),
+                                );
+                            });
+                    }
+                }
+                // Opening fence: prose before it belongs to the previous section.
+                None => {
+                    flush_prose(ui, &mut prose);
+                    code = Some(Vec::new());
+                }
+            }
+            continue;
+        }
+        match code.as_mut() {
+            Some(buf) => buf.push(line),
+            None if t == "---" || t == "***" => {
+                flush_prose(ui, &mut prose);
+                ui.separator();
+            }
+            None => prose.push(line),
+        }
+    }
+    // An unterminated fence is common in truncated hovers — show it rather than swallow it.
+    if let Some(buf) = code {
+        let src = buf.join("\n");
+        if !src.trim().is_empty() {
+            ui.label(egui::RichText::new(src).size(12.0).monospace().color(colors::TEXT()));
+        }
+    }
+    flush_prose(ui, &mut prose);
+}
+
+/// Prose with `**bold**` and `` `code` `` spans, wrapped. Runs are laid out with
+/// [`egui::text::LayoutJob`] so a single wrap applies across the whole paragraph — emitting one
+/// label per span instead would break wrapping at every style change.
+fn inline_markdown(ui: &mut egui::Ui, text: &str) {
+    let mut job = egui::text::LayoutJob::default();
+    job.wrap.max_width = ui.available_width();
+    let body = ui.style().text_styles[&egui::TextStyle::Body].clone();
+    let mono = ui.style().text_styles[&egui::TextStyle::Monospace].clone();
+
+    let mut rest = text;
+    while !rest.is_empty() {
+        let bold = rest.find("**");
+        let code = rest.find('`');
+        // Whichever delimiter comes first wins; a lone/unclosed one is literal text.
+        let (start, close, skip, font, color) = match (bold, code) {
+            (Some(b), c) if c.is_none_or(|c| b < c) => (b, rest[b + 2..].find("**"), 2, body.clone(), colors::TEXT()),
+            (_, Some(c)) => (c, rest[c + 1..].find('`'), 1, mono.clone(), colors::ACCENT()),
+            _ => break,
+        };
+        let Some(end) = close else { break };
+        job.append(&rest[..start], 0.0, fmt(body.clone(), colors::TEXT()));
+        job.append(&rest[start + skip..start + skip + end], 0.0, fmt(font, color));
+        rest = &rest[start + skip + end + skip..];
+    }
+    job.append(rest, 0.0, fmt(body, colors::TEXT()));
+    ui.label(job);
+}
+
+fn fmt(font: egui::FontId, color: egui::Color32) -> egui::TextFormat {
+    egui::TextFormat { font_id: font, color, ..Default::default() }
 }
 
 /// Parse one `git diff -U0` hunk header into gutter marks: `@@ -a,b +c,d @@` — d>0 → lines
@@ -10286,6 +10490,40 @@ fn to_view_diags(diags: &[lsp_types::Diagnostic], rope: &Rope, enc: Encoding) ->
         .collect()
 }
 
+/// The identifier span touching `byte`, or an empty range when the caret is not on a word.
+/// Servers answer an EMPTY code-action range with nothing (see the clangd live test), so every
+/// caret-driven request widens through here first.
+fn word_range_at(rope: &Rope, byte: usize) -> std::ops::Range<usize> {
+    let len = rope.len_bytes();
+    let byte = byte.min(len);
+    let text = rope.slice(..).to_string();
+    // The caret can arrive mid-codepoint (a hover byte derived from an x coordinate). Slicing on a
+    // non-boundary panics, so walk back to one first.
+    let mut byte = byte;
+    while byte > 0 && !text.is_char_boundary(byte) {
+        byte -= 1;
+    }
+    let is_word = |c: char| c.is_alphanumeric() || c == '_';
+    // Anchor on the character BEFORE the caret too: a caret sitting immediately after an
+    // identifier is still on it as far as the user is concerned.
+    let mut start = byte;
+    while start > 0 {
+        let prev = text[..start].chars().next_back().filter(|c| is_word(*c));
+        match prev {
+            Some(c) => start -= c.len_utf8(),
+            None => break,
+        }
+    }
+    let mut end = byte;
+    while end < text.len() {
+        match text[end..].chars().next().filter(|c| is_word(*c)) {
+            Some(c) => end += c.len_utf8(),
+            None => break,
+        }
+    }
+    start..end
+}
+
 fn pos_to_byte(rope: &Rope, p: &lsp_types::Position, enc: Encoding) -> usize {
     let point = Point { line: p.line as usize, col: p.character as usize };
     match enc {
@@ -10382,4 +10620,43 @@ fn run_formatter(bin: &str, args: &[&str], _path: &std::path::Path, input: &str)
         return None;
     }
     String::from_utf8(out.stdout).ok().filter(|s| !s.is_empty())
+}
+
+#[cfg(test)]
+mod hover_and_fix_tests {
+    use super::*;
+
+    fn r(s: &str) -> Rope {
+        Rope::from_str(s)
+    }
+
+    #[test]
+    fn word_range_covers_the_identifier_the_caret_sits_in() {
+        let rope = r("let alpha = beta;");
+        assert_eq!(word_range_at(&rope, 6), 4..9, "mid-identifier");
+        assert_eq!(word_range_at(&rope, 4), 4..9, "at the first byte");
+    }
+
+    #[test]
+    fn word_range_anchors_on_the_identifier_just_left_of_the_caret() {
+        // A caret parked immediately AFTER a word still belongs to that word — this is where the
+        // caret lands after you finish typing an identifier, and the commonest Alt+Enter position.
+        let rope = r("let alpha = beta;");
+        assert_eq!(word_range_at(&rope, 9), 4..9);
+    }
+
+    #[test]
+    fn word_range_is_empty_off_a_word() {
+        let rope = r("a  b");
+        assert_eq!(word_range_at(&rope, 2), 2..2, "in whitespace, touching nothing");
+    }
+
+    #[test]
+    fn word_range_handles_multibyte_and_bounds() {
+        let rope = r("héllo wörld");
+        let span = word_range_at(&rope, 2);
+        assert_eq!(&rope.slice(..).to_string()[span], "héllo");
+        // Past the end must clamp rather than panic.
+        assert_eq!(word_range_at(&rope, 9_999).end, rope.len_bytes());
+    }
 }

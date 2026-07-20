@@ -293,3 +293,55 @@ impl T {
     lsp.shutdown_all();
     let _ = std::fs::remove_dir_all(&root);
 }
+
+/// The regression this exists for: Alt+Enter sent an EMPTY range at the caret, and clangd answers
+/// an empty range with no actions at all — "quick fixes do nothing" while sitting on a red
+/// squiggle. Pins both directions, because the empty-range half is the reason the app widens the
+/// caret to the diagnostic before asking.
+#[test]
+#[ignore = "needs clangd; run with -- --ignored"]
+fn live_clangd_quickfix_needs_a_nonempty_range() {
+    let root = temp_project("clangd-qf");
+    std::fs::write(root.join("compile_flags.txt"), "-std=c11\n").unwrap();
+    // A misspelled member is clangd's canonical "did you mean" fix-it.
+    let src = "struct P { int alpha; };\nint main(void) {\n    struct P p;\n    return p.alpa;\n}\n";
+    let main_c = root.join("main.c");
+    std::fs::write(&main_c, src).unwrap();
+
+    let mut lsp = LspManager::new(Arc::new(|| {}));
+    lsp.open_doc(Lang::C, &root, &main_c, src);
+    let ev = pump_until(&mut lsp, Duration::from_secs(20), |ev| {
+        matches!(ev, LspEvent::Diagnostics { path, diags, .. } if path == &main_c && !diags.is_empty())
+    })
+    .expect("clangd never published a diagnostic");
+    let LspEvent::Diagnostics { diags, .. } = &ev else { unreachable!() };
+    let diags = diags.clone();
+
+    let rope = Rope::from_str(src);
+    let bad = src.find("alpa").expect("fixture");
+
+    let actions_for = |lsp: &mut LspManager, r: std::ops::Range<usize>, gen: u64| {
+        lsp.request_code_actions(&main_c, &rope, r, &diags, gen);
+        let ev = pump_until(lsp, Duration::from_secs(20), |ev| {
+            matches!(ev, LspEvent::CodeActions { generation, .. } if *generation == gen)
+        })
+        .expect("no CodeActions response");
+        let LspEvent::CodeActions { actions, .. } = ev else { unreachable!() };
+        actions
+    };
+
+    // Covering the identifier: the fix-it is offered.
+    assert!(
+        !actions_for(&mut lsp, bad..bad + 4, 1).is_empty(),
+        "clangd offered no quickfix over the misspelled member"
+    );
+    // The bare caret: nothing. This is why request_quick_fixes widens.
+    assert!(
+        actions_for(&mut lsp, bad..bad, 2).is_empty(),
+        "clangd now answers empty ranges — the caret widening in request_quick_fixes may be \
+         removable, re-check before deleting it"
+    );
+
+    lsp.shutdown_all();
+    let _ = std::fs::remove_dir_all(&root);
+}

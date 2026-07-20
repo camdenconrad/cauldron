@@ -332,16 +332,20 @@ impl LspManager {
 
     /// Quick fixes / refactorings for the byte `range` of `path` (right-click, lightbulb).
     /// The response arrives as [`LspEvent::CodeActions`] stamped with `generation` so the app
-    /// can drop stale replies. `context.diagnostics` is deliberately empty — clangd and
-    /// rust-analyzer both key fixes off diagnostics OVERLAPPING the range server-side.
+    /// can drop stale replies.
+    ///
+    /// `diags` must be the server's OWN diagnostic objects overlapping `range`. The spec makes
+    /// `context.diagnostics` the client's job, and clangd in particular derives its quickfixes
+    /// from exactly what it is handed — sending `[]` made it return no fixes at all.
     pub fn request_code_actions(
         &mut self,
         path: &Path,
         rope: &Rope,
         range: std::ops::Range<usize>,
+        diags: &[lsp_types::Diagnostic],
         generation: u64,
     ) {
-        self.request_code_actions_only(path, rope, range, &[], generation);
+        self.request_code_actions_only(path, rope, range, &[], diags, generation);
     }
 
     /// As [`Self::request_code_actions`], but restricted to the given `CodeActionKind` prefixes
@@ -354,6 +358,7 @@ impl LspManager {
         rope: &Rope,
         range: std::ops::Range<usize>,
         only: &[&str],
+        diags: &[lsp_types::Diagnostic],
         generation: u64,
     ) {
         let Some(server) = self.server_for_mut(path) else { return };
@@ -364,7 +369,7 @@ impl LspManager {
         let end = lsp_position(rope, range.end, server.encoding);
         // triggerKind 1 = Invoked. `only` omitted entirely (not `[]`) means "every kind is
         // welcome" — an empty array would instead be read as "nothing qualifies".
-        let mut context = json!({"diagnostics": [], "triggerKind": 1});
+        let mut context = json!({"diagnostics": diags, "triggerKind": 1});
         if !only.is_empty() {
             context["only"] = json!(only);
         }
