@@ -2097,6 +2097,11 @@ impl EditorView {
         self.usage_marks = Some((buffer.generation, marks));
     }
 
+    /// The primary selection as a byte range (empty when it is a bare caret).
+    pub fn primary_selection_range(&self) -> std::ops::Range<usize> {
+        self.selections.primary().range()
+    }
+
     /// Are usage marks currently shown? Lets the app route Escape to clearing them first.
     pub fn usage_marks_shown(&self) -> bool {
         self.usage_marks.is_some()

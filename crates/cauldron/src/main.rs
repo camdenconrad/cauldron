@@ -3566,6 +3566,7 @@ impl App {
             C::SwitchHeaderSource => self.switch_header_source(),
             C::CompleteStatement => self.editor_command(ctx, |v, b, n| v.complete_statement(b, n)),
             C::ExtractVariable => self.extract_variable(ctx),
+            C::ExtractFunction => self.extract_function(ctx),
             C::HighlightUsagesInFile => {
                 let g = &mut self.groups[self.focused];
                 let a = g.active;
@@ -6415,6 +6416,62 @@ impl App {
     }
 
     /// Ctrl+G: open the go-to-line prompt as the only overlay.
+    /// Offer Extract Function only where it can work: a C file with a real selection.
+    fn extract_function_available(&self) -> bool {
+        let g = &self.groups[self.focused];
+        g.files.get(g.active).is_some_and(|f| {
+            f.loaded && matches!(f.lang, Some(Lang::C)) && !f.view.primary_selection_range().is_empty()
+        })
+    }
+
+    /// Ctrl+Alt+M: lift the selected statements into a new C function and call it.
+    ///
+    /// The engine ([`cauldron_psi::extract`]) refuses anything it cannot prove safe, and the
+    /// refusal is shown verbatim — "selection contains `return`" tells the user what to change,
+    /// where a silent no-op tells them nothing.
+    fn extract_function(&mut self, ctx: &egui::Context) {
+        let now = ctx.input(|i| i.time);
+        let g = &self.groups[self.focused];
+        let Some(f) = g.files.get(g.active).filter(|f| f.loaded) else { return };
+        if !matches!(f.lang, Some(Lang::C)) {
+            self.lsp_message = Some("Extract Function is C-only for now".into());
+            return;
+        }
+        let path = f.path.clone();
+        let src = f.buffer.rope().to_string();
+        let sel = f.view.primary_selection_range();
+        if sel.is_empty() {
+            self.lsp_message = Some("select the statements to extract".into());
+            return;
+        }
+        let plan = match cauldron_psi::extract::plan(&src, sel, "extracted") {
+            Ok(p) => p,
+            Err(e) => {
+                self.lsp_message = Some(e.to_string());
+                return;
+            }
+        };
+        // Both edits in ONE transaction: the file does not compile with only half of them, so a
+        // single undo must take both back.
+        let edits = vec![
+            cauldron_psi::chsig::Edit {
+                range: plan.insert_at..plan.insert_at,
+                text: plan.function_text.clone(),
+            },
+            cauldron_psi::chsig::Edit { range: plan.replace.clone(), text: plan.call_text.clone() },
+        ];
+        match self.apply_psi_edits(&path, &edits, now) {
+            Ok(()) => {
+                let sig = match &plan.returns {
+                    Some(r) => format!("{} extracted(…)", r.ty),
+                    None => "void extracted(…)".to_string(),
+                };
+                self.lsp_message = Some(format!("{sig} — Shift+F6 to rename it"));
+            }
+            Err(e) => self.lsp_message = Some(e),
+        }
+    }
+
     /// Ctrl+Alt+V. The declaration keyword comes from the language, and the new name goes
     /// straight into the rename prompt — the placeholder is never what you want to keep.
     fn extract_variable(&mut self, ctx: &egui::Context) {
@@ -7512,6 +7569,9 @@ impl eframe::App for App {
         }
         if ctx.input(|i| i.modifiers.command && i.modifiers.alt && i.key_pressed(egui::Key::V)) {
             self.extract_variable(ctx);
+        }
+        if ctx.input(|i| i.modifiers.command && i.modifiers.alt && i.key_pressed(egui::Key::M)) {
+            self.extract_function(ctx);
         }
         if ctx.input(|i| i.modifiers.command && i.modifiers.shift && i.key_pressed(egui::Key::F7)) {
             self.run_command(palette::Command::HighlightUsagesInFile, ctx);
@@ -8894,6 +8954,7 @@ impl eframe::App for App {
         if let Some((pos, path, actions)) = self.fix_menu.clone() {
             let mut close_menu = false;
             let mut extract_var = false;
+            let mut extract_fn = false;
             egui::Area::new("quickfixes".into())
                 .fixed_pos(pos)
                 .order(egui::Order::Foreground)
@@ -8926,6 +8987,18 @@ impl eframe::App for App {
                                 .clicked_by(egui::PointerButton::Primary)
                             {
                                 extract_var = true;
+                                close_menu = true;
+                            }
+                            if self.extract_function_available()
+                                && ui
+                                    .selectable_label(
+                                        false,
+                                        egui::RichText::new("Extract Function…      Ctrl+Alt+M")
+                                            .size(12.5),
+                                    )
+                                    .clicked_by(egui::PointerButton::Primary)
+                            {
+                                extract_fn = true;
                                 close_menu = true;
                             }
                             // Change Signature is ours (PSI-driven) — no C language server
@@ -8978,6 +9051,9 @@ impl eframe::App for App {
                 });
             if extract_var {
                 self.extract_variable(ctx);
+            }
+            if extract_fn {
+                self.extract_function(ctx);
             }
             if close_menu || ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
                 self.fix_menu = None;
