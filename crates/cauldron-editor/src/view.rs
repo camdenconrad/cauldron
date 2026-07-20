@@ -1262,6 +1262,8 @@ impl EditorView {
             let (first_l, last_l, total_l) = (first, last, total);
             let gen = buffer.generation;
             self.paint_minimap(ui, buffer.rope(), total_l, first_l, last_l, row_h, gen);
+            // After the minimap, so the stripe is never painted under it.
+            self.paint_error_stripe(ui, total_l, buffer.rope());
 
             // 3) Pointer → selection (uses this frame's galleys; caret shows next frame). Runs
             //    regardless of focus: the focusing click also places the caret, and right-click
@@ -1955,6 +1957,31 @@ impl EditorView {
         }
     }
 
+    /// Tab on a bare caret: expand a postfix or live template, returning whether one fired.
+    ///
+    /// Postfix is tried FIRST. `x.if` ends in a word that is also a live-template key in several
+    /// languages, and the postfix reading is unambiguous where the live one would silently eat the
+    /// expression the user just wrote.
+    fn expand_template(&mut self, buffer: &mut Buffer, now: f64) -> bool {
+        let caret = self.selections.primary().head;
+        let text = buffer.rope().to_string();
+        if let Some(hit) = crate::templates::resolve_postfix(&text, caret, self.lang) {
+            // Re-indent the body to the line it lands on: a snippet written flat would otherwise
+            // paste its second line at column zero.
+            let indent = leading_ws(buffer.rope(), hit.replace.start);
+            let body = reindent_snippet(&hit.snippet, &indent);
+            self.insert_snippet(buffer, hit.replace, &body, now);
+            return true;
+        }
+        if let Some((range, body)) = crate::templates::resolve_live(&text, caret, self.lang) {
+            let indent = leading_ws(buffer.rope(), range.start);
+            let body = reindent_snippet(body, &indent);
+            self.insert_snippet(buffer, range, &body, now);
+            return true;
+        }
+        false
+    }
+
     /// Ctrl+Alt+V: pull the selected expression out into a new local declared on its own line
     /// above, and replace the selection with the new name. Returns the byte range of the inserted
     /// NAME so the caller can start an inline rename on it — you almost always want to name it
@@ -2291,12 +2318,12 @@ impl EditorView {
             Key::Tab if self.snippet.is_some() && !m.shift => self.snippet_step(buffer, 1),
             Key::Tab if self.snippet.is_some() && m.shift => self.snippet_step(buffer, -1),
             // Shift+Tab always unindents the spanned line(s); Tab with a selection block-indents,
-            // Tab on a bare caret inserts (JetBrains).
+            // Tab on a bare caret expands a template if one matches, else inserts (JetBrains).
             Key::Tab if m.shift => self.indent_lines(buffer, true, now),
             Key::Tab => {
                 if self.selections.ranges.iter().any(|s| !s.is_empty()) {
                     self.indent_lines(buffer, false, now);
-                } else {
+                } else if !self.expand_template(buffer, now) {
                     self.insert(buffer, TAB, EditKind::Other, now);
                 }
             }
@@ -3325,6 +3352,53 @@ impl EditorView {
     /// Overlay-painted inside the visible rect; click/drag jumps the scroll. Skipped when the
     /// whole file already fits on screen.
     #[allow(clippy::too_many_arguments)]
+    /// The error stripe: a full-file column of problem marks down the right edge.
+    ///
+    /// Deliberately NOT part of the minimap, which is a sliding window showing the neighbourhood
+    /// of the viewport. The stripe's whole value is that it is proportional to the WHOLE file — a
+    /// glance tells you there are three errors near the end of a two-thousand-line file, which a
+    /// windowed view structurally cannot. Clicking a mark jumps to it.
+    fn paint_error_stripe(&mut self, ui: &mut egui::Ui, total: usize, rope: &Rope) {
+        const STRIPE_W: f32 = 5.0;
+        if self.diagnostics.is_empty() || total == 0 {
+            return;
+        }
+        let vis = ui.clip_rect();
+        if vis.height() < 60.0 {
+            return;
+        }
+        let stripe = Rect::from_min_max(
+            Pos2::new(vis.right() - STRIPE_W, vis.top()),
+            Pos2::new(vis.right(), vis.bottom()),
+        );
+        let p = ui.painter();
+        let h = stripe.height();
+        // Marks are 3px tall regardless of file size: one line of a huge file would otherwise be
+        // a sub-pixel sliver that never actually paints.
+        let mut hit: Option<usize> = None;
+        let pointer = ui.input(|i| i.pointer.hover_pos());
+        let clicked = ui.input(|i| i.pointer.primary_pressed());
+        for d in &self.diagnostics {
+            let line = rope.byte_to_line(d.range.start.min(rope.len_bytes()));
+            let y = stripe.top() + (line as f32 / total as f32) * h;
+            let r = Rect::from_min_max(
+                Pos2::new(stripe.left() + 1.0, y),
+                Pos2::new(stripe.right() - 1.0, y + 3.0),
+            );
+            p.rect_filled(r, 1.0, d.color());
+            if let Some(pt) = pointer {
+                // A generous hit box: a 3px target is not clickable in practice.
+                let hot = r.expand2(egui::vec2(2.0, 3.0));
+                if hot.contains(pt) && clicked {
+                    hit = Some(d.range.start);
+                }
+            }
+        }
+        if let Some(byte) = hit {
+            self.jump_to(byte, rope);
+        }
+    }
+
     fn paint_minimap(
         &mut self,
         ui: &mut egui::Ui,
@@ -4300,6 +4374,25 @@ fn line_content_end_at(rope: &Rope, byte: usize) -> usize {
     start + text.trim_end_matches(['\n', '\r']).len()
 }
 
+/// Prefix every line of a snippet body after the first with `indent`. Template bodies are
+/// written flat so they read as code; the caret's own indentation is only known at expansion.
+fn reindent_snippet(body: &str, indent: &str) -> String {
+    if indent.is_empty() {
+        return body.to_string();
+    }
+    let mut out = String::with_capacity(body.len() + indent.len() * 4);
+    for (i, line) in body.split('\n').enumerate() {
+        if i > 0 {
+            out.push('\n');
+            if !line.is_empty() {
+                out.push_str(indent);
+            }
+        }
+        out.push_str(line);
+    }
+    out
+}
+
 fn is_word_byte(b: u8) -> bool {
     b.is_ascii_alphanumeric() || b == b'_' || b >= 0x80
 }
@@ -4984,6 +5077,59 @@ mod tests {
     fn sel_text(v: &EditorView, b: &Buffer) -> String {
         let r = v.selections.primary().range();
         b.rope().byte_slice(r).into()
+    }
+
+    fn tab(v: &mut EditorView, b: &mut Buffer) {
+        v.handle_key(b, Key::Tab, egui::Modifiers::default(), 0.0);
+    }
+
+    #[test]
+    fn tab_expands_a_live_template() {
+        let (mut v, mut b) = setup("for");
+        v.selections = Selections::single(3);
+        tab(&mut v, &mut b);
+        let out = b.rope().to_string();
+        assert!(out.starts_with("for (int i = 0; i < n; i++) {"), "{out}");
+        assert!(!out.contains("${"), "placeholders must be expanded, not literal: {out}");
+    }
+
+    #[test]
+    fn tab_after_a_non_template_word_still_indents() {
+        let (mut v, mut b) = setup("format");
+        v.selections = Selections::single(6);
+        tab(&mut v, &mut b);
+        assert_eq!(b.rope().to_string(), "format    ", "`format` is not `for`");
+    }
+
+    #[test]
+    fn tab_expands_a_postfix_template_over_the_whole_expression() {
+        let (mut v, mut b) = setup("    compute(a, b).if");
+        let n = b.rope().len_bytes();
+        v.selections = Selections::single(n);
+        tab(&mut v, &mut b);
+        let out = b.rope().to_string();
+        assert!(out.starts_with("    if (compute(a, b)) {"), "{out}");
+        // The body must be indented to the line the expansion landed on.
+        assert!(out.contains("\n    }"), "closing brace not re-indented: {out:?}");
+    }
+
+    #[test]
+    fn postfix_wins_over_a_live_template_of_the_same_name() {
+        // `x.if` must not expand the bare `if` template and eat the expression.
+        let (mut v, mut b) = setup("ready.if");
+        let n = b.rope().len_bytes();
+        v.selections = Selections::single(n);
+        tab(&mut v, &mut b);
+        assert!(b.rope().to_string().starts_with("if (ready) {"), "{}", b.rope());
+    }
+
+    #[test]
+    fn tab_with_a_selection_still_indents_rather_than_expanding() {
+        let (mut v, mut b) = setup("for\nbar\n");
+        v.selections =
+            Selections { ranges: vec![Selection { anchor: 0, head: 7, goal_col: None }], primary: 0 };
+        tab(&mut v, &mut b);
+        assert!(b.rope().to_string().starts_with("    for"), "{}", b.rope());
     }
 
     #[test]

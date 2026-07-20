@@ -15,6 +15,7 @@ pub mod highlight;
 pub mod position;
 pub mod selection;
 pub mod snippet;
+pub mod templates;
 pub mod syntax;
 pub mod theme;
 pub mod view;
