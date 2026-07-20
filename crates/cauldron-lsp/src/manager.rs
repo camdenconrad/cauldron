@@ -740,8 +740,16 @@ impl LspManager {
         if self.clangd_opts == opts {
             return;
         }
+        let old = self.clangd_opts;
         self.clangd_opts = opts;
-        self.restart_kind(ServerKind::Clangd);
+        // Restart only the server whose config actually changed. Bouncing rust-analyzer because
+        // a C setting moved would throw away a several-minute index for nothing.
+        if old.clang_tidy != opts.clang_tidy {
+            self.restart_kind(ServerKind::Clangd);
+        }
+        if old.clippy != opts.clippy {
+            self.restart_kind(ServerKind::RustAnalyzer);
+        }
     }
 
     pub fn restart_kind(&mut self, kind: ServerKind) {

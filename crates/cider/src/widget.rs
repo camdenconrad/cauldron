@@ -30,6 +30,23 @@ pub fn terminal_ui(
     emoji: &mut Emoji,
     dragging_sel: &mut bool,
 ) -> egui::Response {
+    terminal_ui_opts(ui, s, cfg, emoji, dragging_sel, true)
+}
+
+/// As [`terminal_ui`], but `interactive: false` renders a READ-ONLY grid: it still scrolls,
+/// selects and copies, but never takes keyboard focus and never forwards a keystroke to the PTY.
+///
+/// This exists for panes that SHOW a program's output rather than host a shell. A read-only grid
+/// that still grabbed focus made every other keyboard surface in the app unreachable while it was
+/// visible — you could not type in the actual terminal, because the output pane had the keys.
+pub fn terminal_ui_opts(
+    ui: &mut egui::Ui,
+    s: &mut Session,
+    cfg: &Config,
+    emoji: &mut Emoji,
+    dragging_sel: &mut bool,
+    interactive: bool,
+) -> egui::Response {
     let ctx = ui.ctx().clone();
     s.pump(&ctx);
 
@@ -51,10 +68,15 @@ pub fn terminal_ui(
     }
 
     let response = ui.interact(area, ui.id().with("cider-embed"), egui::Sense::click_and_drag());
-    if response.clicked() || response.drag_started() {
+    if interactive && (response.clicked() || response.drag_started()) {
         response.request_focus();
     }
-    let focused = response.has_focus();
+    // A read-only grid must also RELEASE focus it somehow acquired (a stale request from a
+    // previous frame, egui's focus traversal), or it would keep swallowing keys.
+    if !interactive && response.has_focus() {
+        response.surrender_focus();
+    }
+    let focused = interactive && response.has_focus();
 
     // While the grid has focus, every key belongs to the SHELL — egui's built-in widget focus
     // traversal must not eat any of them. Without this lock, Tab moves focus to the next widget

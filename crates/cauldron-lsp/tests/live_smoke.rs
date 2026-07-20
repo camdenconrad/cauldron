@@ -345,3 +345,63 @@ fn live_clangd_quickfix_needs_a_nonempty_range() {
     lsp.shutdown_all();
     let _ = std::fs::remove_dir_all(&root);
 }
+
+/// Rust parity check: rust-analyzer ships Extract Function, Extract Variable and Generate
+/// Function as ASSISTS (code actions), so Cauldron does not need its own engines for Rust the way
+/// it does for C. This asserts they actually arrive through the code-action path — i.e. that the
+/// `only`-filter and diagnostics work done for C did not leave Rust behind.
+#[test]
+#[ignore = "needs rust-analyzer; run with -- --ignored"]
+fn live_rust_analyzer_offers_refactoring_assists() {
+    let root = temp_project("ra-assists");
+    std::fs::write(root.join("Cargo.toml"), "[package]\nname=\"a\"\nversion=\"0.1.0\"\nedition=\"2021\"\n")
+        .unwrap();
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    let src = "fn main() {\n    let total = 1 + 2 * 3;\n    println!(\"{total}\");\n}\n";
+    let main_rs = root.join("src/main.rs");
+    std::fs::write(&main_rs, src).unwrap();
+
+    let mut lsp = LspManager::new(Arc::new(|| {}));
+    lsp.open_doc(Lang::Rust, &root, &main_rs, src);
+    // Wait for the server to be usable at all.
+    pump_until(&mut lsp, Duration::from_secs(90), |ev| {
+        matches!(ev, LspEvent::State(cauldron_lsp::ServerState::Ready) | LspEvent::Quiescent)
+    })
+    .expect("rust-analyzer never became ready");
+
+    let rope = Rope::from_str(src);
+    let expr = src.find("1 + 2 * 3").expect("fixture");
+    let range = expr..expr + "1 + 2 * 3".len();
+
+    // Retry: assists only appear once the crate graph is built, which lands after Ready.
+    let mut titles: Vec<String> = Vec::new();
+    for gen in 1..=12u64 {
+        lsp.request_code_actions(&main_rs, &rope, range.clone(), &[], gen);
+        if let Some(ev) = pump_until(&mut lsp, Duration::from_secs(20), |ev| {
+            matches!(ev, LspEvent::CodeActions { generation, .. } if *generation == gen)
+        }) {
+            let LspEvent::CodeActions { actions, .. } = ev else { unreachable!() };
+            titles = actions
+                .iter()
+                .map(|a| match a {
+                    lsp_types::CodeActionOrCommand::CodeAction(c) => c.title.clone(),
+                    lsp_types::CodeActionOrCommand::Command(c) => c.title.clone(),
+                })
+                .collect();
+            if !titles.is_empty() {
+                break;
+            }
+        }
+        std::thread::sleep(Duration::from_secs(2));
+    }
+    eprintln!("rust-analyzer assists over an expression: {titles:?}");
+    assert!(!titles.is_empty(), "no assists arrived at all — the code-action path is broken");
+    let lower = titles.join(" | ").to_lowercase();
+    assert!(
+        lower.contains("extract") || lower.contains("variable"),
+        "expected an extract assist among {titles:?}"
+    );
+
+    lsp.shutdown_all();
+    let _ = std::fs::remove_dir_all(&root);
+}

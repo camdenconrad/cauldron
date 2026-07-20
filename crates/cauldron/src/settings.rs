@@ -131,6 +131,10 @@ pub struct Settings {
     /// Run clang-tidy inside clangd (C/C++ diagnostics beyond the compiler's own).
     #[serde(default = "default_true")]
     pub clang_tidy: bool,
+    /// Check Rust with `cargo clippy` rather than `cargo check` — the Rust analogue of
+    /// `clang_tidy`, and the difference between lint feedback and bare compiler errors.
+    #[serde(default = "default_true")]
+    pub clippy: bool,
 }
 
 impl Default for Settings {
@@ -144,6 +148,7 @@ impl Default for Settings {
             theme: ThemeChoice::Dark,
             ai: AiSettings::default(),
             clang_tidy: true,
+            clippy: true,
         }
     }
 }
@@ -209,6 +214,7 @@ mod tests {
                 ..Default::default()
             },
             clang_tidy: false,
+            clippy: false,
         };
         let back: Settings = serde_json::from_str(&serde_json::to_string(&s).unwrap()).unwrap();
         assert_eq!(back, s);
@@ -220,6 +226,7 @@ mod tests {
     fn settings_file_without_clang_tidy_still_loads() {
         let s: Settings = serde_json::from_str(r#"{"editor_font": 14.0}"#).unwrap();
         assert!(s.clang_tidy, "missing field must default to on");
+        assert!(s.clippy, "and so must clippy");
     }
 
     /// A file with no fields at all (or unknown ones) still loads, on defaults.
@@ -279,6 +286,7 @@ mod tests {
             theme: ThemeChoice::Dark,
             ai: AiSettings::default(),
             clang_tidy: true,
+            clippy: true,
         });
         let back = load();
         assert_eq!(back.editor_font, FONT_MAX, "hostile value clamped on load");

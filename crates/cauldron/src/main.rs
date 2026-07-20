@@ -1112,7 +1112,10 @@ impl App {
             hover_anchor: None,
         };
         // Seed the manager BEFORE any server spawns — clangd reads these flags only at spawn.
-        app.lsp.set_clangd_options(cauldron_lsp::ClangdOptions { clang_tidy: prefs.clang_tidy });
+        app.lsp.set_clangd_options(cauldron_lsp::ClangdOptions {
+            clang_tidy: prefs.clang_tidy,
+            clippy: prefs.clippy,
+        });
         if app.no_project {
             // Nothing to walk/restore — surface the picker (recents listed first) as the
             // welcome state over the existing empty-group constellation.
@@ -2782,6 +2785,7 @@ impl App {
             ai: self.ai_settings.clone(),
             // The manager owns this — reading it back avoids a second copy that can drift.
             clang_tidy: self.lsp.clangd_options().clang_tidy,
+            clippy: self.lsp.clangd_options().clippy,
         });
     }
 
@@ -9506,15 +9510,23 @@ impl eframe::App for App {
                                     // Read-modify-write through the manager, which owns the
                                     // value; a local copy here would be a second source of truth.
                                     let mut opts = self.lsp.clangd_options();
-                                    if ui
+                                    let mut changed = ui
                                         .checkbox(&mut opts.clang_tidy, "clang-tidy (C/C++)")
                                         .on_hover_text(
                                             "Run clang-tidy checks inside clangd. Restarts clangd \
                                              (its flags are read only at startup), so diagnostics \
                                              go quiet for a moment.",
                                         )
-                                        .changed()
-                                    {
+                                        .changed();
+                                    changed |= ui
+                                        .checkbox(&mut opts.clippy, "clippy (Rust)")
+                                        .on_hover_text(
+                                            "Check with `cargo clippy` instead of `cargo check`. \
+                                             Restarts rust-analyzer, and the first check after a \
+                                             switch recompiles.",
+                                        )
+                                        .changed();
+                                    if changed {
                                         self.lsp.set_clangd_options(opts);
                                         self.save_settings();
                                     }

@@ -978,7 +978,10 @@ fn file_command(file: &Path, root: &Path, extra: &[String]) -> Option<(String, V
                 vec![
                     "-c".to_string(),
                     format!(
-                        "mkdir -p {dir_q} && rm -f {out_q} && rustc -o {out_q} {src} \
+                        // `-g`: same reason as the C path — this artifact is what Debug attaches
+                        // to, and without debug info lldb has no line table to bind a breakpoint
+                        // against. (rustc defaults to -O0, so no opt flag is needed.)
+                        "mkdir -p {dir_q} && rm -f {out_q} && rustc -g -o {out_q} {src} \
                          && exec {out_q} {rest}",
                         src = sh_quote(&path),
                     ),
@@ -1643,7 +1646,7 @@ mod tests {
         assert_eq!(binf.1, vec!["run", "--manifest-path", &manifest, "--bin", "tool"]);
         let stray = command_line(&file_cfg(&root.join("scratch/thing.rs")), &root);
         assert_eq!(stray.0, "sh");
-        assert!(stray.1[1].contains(" rustc -o "), "{:?}", stray.1);
+        assert!(stray.1[1].contains(" rustc -g -o "), "{:?}", stray.1);
 
         // A WORKSPACE member: the file's OWN crate manifest wins, not the virtual root's — the
         // exact case (Cauldron itself) where the old root-anchored check fell through to a rustc
@@ -1666,7 +1669,7 @@ mod tests {
         std::fs::create_dir_all(ws.join("src")).unwrap();
         let stray_ws = command_line(&file_cfg(&ws.join("src/main.rs")), &ws);
         assert_eq!(stray_ws.0, "sh", "a virtual-root src/main.rs is not a cargo target");
-        assert!(stray_ws.1[1].contains(" rustc -o "), "{:?}", stray_ws.1);
+        assert!(stray_ws.1[1].contains(" rustc -g -o "), "{:?}", stray_ws.1);
         let _ = std::fs::remove_dir_all(&ws);
 
         // A file we cannot run says so and exits non-zero, rather than spawning something bogus.
@@ -2140,5 +2143,29 @@ mod single_file_debug_tests {
         let b = run_artifact(Path::new("/tmp/x.c"), "x");
         assert_eq!(a, b);
         assert_ne!(a, run_artifact(Path::new("/other/x.c"), "x"), "distinct sources, distinct artifacts");
+    }
+}
+
+#[cfg(test)]
+mod rust_single_file_debug_tests {
+    use super::*;
+
+    /// Same contract as the C/C++ paths: a single-file Run produces the artifact Debug attaches
+    /// to, so it must carry debug info or no breakpoint can bind.
+    #[test]
+    fn single_file_rust_compiles_with_debug_info() {
+        let cfg = RunConfig {
+            name: "t".into(),
+            kind: RunKind::File,
+            // A path no Cargo.toml claims, so it takes the standalone rustc branch.
+            program: "/tmp/cauldron-scratch/stray.rs".into(),
+            args: Vec::new(),
+            cwd: None,
+            env: Vec::new(),
+        };
+        let (prog, args, _) = command_line(&cfg, Path::new("/tmp/cauldron-scratch"));
+        assert_eq!(prog, "sh");
+        let script = args.get(1).cloned().unwrap_or_default();
+        assert!(script.contains(" rustc -g -o "), "rustc line lacks -g: {script}");
     }
 }

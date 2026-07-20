@@ -26,7 +26,7 @@ use crate::{Encoding, ServerKind};
 /// per-kind deltas add rust-analyzer's pull-diagnostics + serverStatus capabilities and its
 /// initializationOptions config tree. clangd takes `initializationOptions: null` — it is
 /// configured via CLI flags and `.clangd` files instead.
-pub fn initialize_params(root: &Path, kind: ServerKind) -> Value {
+pub fn initialize_params(root: &Path, kind: ServerKind, opts: crate::ClangdOptions) -> Value {
     let root_uri = file_uri(root).to_string();
     let root_path = root.to_string_lossy().into_owned();
     let folder_name = root
@@ -63,7 +63,9 @@ pub fn initialize_params(root: &Path, kind: ServerKind) -> Value {
         // no didChangeWatchedFiles in v1.
         ServerKind::RustAnalyzer => json!({
             "checkOnSave": true,
-            "check": {"command": "check"},
+            // `clippy` gives real lint feedback; `check` gives only what rustc would have said
+            // during the build anyway. Same choice as clang-tidy on the C side, same default.
+            "check": {"command": if opts.clippy { "clippy" } else { "check" }},
             "cargo": {"buildScripts": {"enable": true}},
             "procMacro": {"enable": true},
             "files": {"watcher": "server"},
@@ -257,11 +259,40 @@ mod tests {
     use super::*;
 
     fn clangd_params() -> Value {
-        initialize_params(Path::new("/tmp/proj"), ServerKind::Clangd)
+        initialize_params(Path::new("/tmp/proj"), ServerKind::Clangd, crate::ClangdOptions::default())
     }
 
     fn ra_params() -> Value {
-        initialize_params(Path::new("/tmp/proj"), ServerKind::RustAnalyzer)
+        initialize_params(Path::new("/tmp/proj"), ServerKind::RustAnalyzer, crate::ClangdOptions::default())
+    }
+
+    /// The Rust analogue of the clang-tidy flag: `check.command` decides whether Rust
+    /// diagnostics are lint feedback or just what the compiler would have said anyway.
+    #[test]
+    fn clippy_option_selects_the_rust_analyzer_check_command() {
+        let root = std::path::Path::new("/w");
+        let on = initialize_params(root, ServerKind::RustAnalyzer, crate::ClangdOptions {
+            clang_tidy: true,
+            clippy: true,
+        });
+        assert_eq!(on["initializationOptions"]["check"]["command"], "clippy");
+        let off = initialize_params(root, ServerKind::RustAnalyzer, crate::ClangdOptions {
+            clang_tidy: true,
+            clippy: false,
+        });
+        assert_eq!(off["initializationOptions"]["check"]["command"], "check");
+    }
+
+    /// clangd is configured by CLI flags only; handing it initializationOptions would be a
+    /// protocol error waiting to happen.
+    #[test]
+    fn clangd_still_gets_null_initialization_options() {
+        let p = initialize_params(
+            std::path::Path::new("/w"),
+            ServerKind::Clangd,
+            crate::ClangdOptions::default(),
+        );
+        assert!(p["initializationOptions"].is_null());
     }
 
     #[test]
@@ -356,7 +387,9 @@ mod tests {
             p["initializationOptions"],
             json!({
                 "checkOnSave": true,
-                "check": {"command": "check"},
+                // clippy by DEFAULT — see clippy_option_selects_the_rust_analyzer_check_command.
+                // `check` alone reports only what the compiler would have said during the build.
+                "check": {"command": "clippy"},
                 "cargo": {"buildScripts": {"enable": true}},
                 "procMacro": {"enable": true},
                 "files": {"watcher": "server"},
@@ -367,7 +400,7 @@ mod tests {
 
     #[test]
     fn pyright_initialization_options() {
-        let p = initialize_params(Path::new("/tmp/proj"), ServerKind::Pyright);
+        let p = initialize_params(Path::new("/tmp/proj"), ServerKind::Pyright, crate::ClangdOptions::default());
         assert_eq!(
             p["initializationOptions"],
             json!({
@@ -388,7 +421,7 @@ mod tests {
     #[test]
     fn web_servers_take_shared_skeleton_with_null_options() {
         for kind in [ServerKind::TsServer, ServerKind::CssLs, ServerKind::HtmlLs] {
-            let p = initialize_params(Path::new("/tmp/proj"), kind);
+            let p = initialize_params(Path::new("/tmp/proj"), kind, crate::ClangdOptions::default());
             assert!(p["initializationOptions"].is_null(), "{kind:?}");
             // Shared skeleton intact…
             assert_eq!(p["capabilities"]["general"]["positionEncodings"], json!(["utf-8", "utf-16"]), "{kind:?}");

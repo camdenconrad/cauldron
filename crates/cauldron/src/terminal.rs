@@ -37,15 +37,10 @@ pub struct TerminalPane {
     focus_pending: bool,
     /// The Run button's PTY. Deliberately NOT a member of `terms`: a program you launched is
     /// output, not a shell you opened, and it belongs under Output where the user goes looking
-    /// for it. It keeps a real PTY (colors, progress bars, interactive stdin) — that is the
-    /// whole reason Run never used the piped [`crate::runner::Runner`].
+    /// for it. It is still a real PTY — colors, progress bars, and a tty-shaped stdout are why
+    /// Run never used the piped [`crate::runner::Runner`] — but it is rendered READ-ONLY, so it
+    /// never competes with the actual terminal for the keyboard.
     run: Option<Term>,
-    /// Focus the run grid on its next render (just launched).
-    run_focus_pending: bool,
-    /// Did the run grid hold egui focus last frame? Cleared every frame by `pump_all` and
-    /// re-established only by an actual `run_ui` render, so a hidden Output pane can never leave
-    /// a stale "the program owns the keyboard".
-    run_has_focus: bool,
     /// Did the active grid hold egui focus on the last frame it rendered? Read via
     /// [`TerminalPane::shell_focused`] by the global key handling, which must keep its hands off
     /// keys the shell owns. Stale by at most one frame, which focus changes tolerate.
@@ -68,8 +63,6 @@ impl TerminalPane {
             focus_pending: false,
             has_focus: false,
             run: None,
-            run_focus_pending: false,
-            run_has_focus: false,
         }
     }
 
@@ -120,9 +113,12 @@ impl TerminalPane {
     }
 
     /// Run one command line in a fresh PTY owned by the Output pane — real terminal semantics for
-    /// the Run button: colors, progress bars, interactive stdin. Any previous run is dropped first
-    /// (SIGHUP ends its foreground child). The command is written into a fresh shell's stdin; the
-    /// PTY buffers it until the shell is ready.
+    /// the Run button: colors and progress bars work because the program still sees a tty. Any
+    /// previous run is dropped first (SIGHUP ends its foreground child). The command is written
+    /// into a fresh shell's stdin; the PTY buffers it until the shell is ready.
+    ///
+    /// The program cannot READ stdin here — the Output grid is read-only (see [`Self::run_ui`]).
+    /// A program that needs interactive input should be run from the terminal pane instead.
     ///
     /// This does NOT open the terminal pane: the output surfaces under Output, rendered by
     /// [`TerminalPane::run_ui`]. The caller is responsible for showing that tab.
@@ -133,7 +129,6 @@ impl TerminalPane {
                 s.write(format!("{cmdline}\n").as_bytes());
                 self.run = Some(Term { session: s, label: cmdline.to_string() });
                 self.spawn_error = None;
-                self.run_focus_pending = true;
             }
             Err(e) => self.spawn_error = Some(format!("{e:#}")),
         }
@@ -154,20 +149,18 @@ impl TerminalPane {
     /// is no run, so Output can fall back to the piped build log.
     pub fn run_ui(&mut self, ui: &mut egui::Ui) -> bool {
         let Some(t) = self.run.as_mut() else { return false };
-        let resp = cider::widget::terminal_ui(
+        // READ-ONLY. The Output pane SHOWS a program's output; it is not a shell. Making it
+        // focusable so a program could read stdin meant it swallowed the keyboard whenever it was
+        // visible, and the real terminal beside it became unusable. Scrolling, selecting and
+        // copying still work; keystrokes do not reach the PTY.
+        let _resp = cider::widget::terminal_ui_opts(
             ui,
             &mut t.session,
             &self.cfg,
             &mut self.emoji,
             &mut self.dragging_sel,
+            false,
         );
-        if self.run_focus_pending {
-            resp.request_focus();
-            self.run_focus_pending = false;
-        }
-        // The run grid takes the keyboard on the same terms as a shell — a program reading stdin
-        // must get the keystrokes, and the global handling has to keep its hands off them.
-        self.run_has_focus = resp.has_focus();
         true
     }
 
@@ -185,8 +178,6 @@ impl TerminalPane {
         if let Some(t) = self.run.as_mut() {
             t.session.pump(ctx);
         }
-        // Re-established below only by a real run_ui render (see the field docs).
-        self.run_has_focus = false;
     }
 
     /// Kill the running program (dropping the session SIGHUPs the shell and its child) and clear
@@ -213,7 +204,8 @@ impl TerminalPane {
     /// claiming any key the shell wants (Tab, Ctrl+Tab): while you're typing in the terminal, the
     /// terminal gets the keystroke. False whenever the pane is closed or shows no grid at all.
     pub fn shell_focused(&self) -> bool {
-        (self.open && self.has_focus) || self.run_has_focus
+        // The run grid is deliberately excluded: it is read-only and never holds the keyboard.
+        self.open && self.has_focus
     }
 
     pub fn ui_embedded(&mut self, ui: &mut egui::Ui, root: &Path) {

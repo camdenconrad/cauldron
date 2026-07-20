@@ -65,12 +65,16 @@ pub(crate) enum PendingKind {
     Generic,
 }
 
-/// clangd command-line knobs the user controls. Kept out of `initializationOptions` because
-/// clangd genuinely has none — it is configured by CLI flags and `.clangd` files only.
+/// Analysis knobs the user controls, across servers. clangd's reach it as CLI flags (it has no
+/// `initializationOptions` at all); rust-analyzer's reach it through its config tree. Both are
+/// read only at SPAWN, so changing either restarts that server.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ClangdOptions {
     /// Run clang-tidy checks alongside the compiler diagnostics.
     pub clang_tidy: bool,
+    /// Run `cargo clippy` instead of `cargo check` for Rust diagnostics. The exact analogue of
+    /// `clang_tidy`: without it you get only what the compiler would have said anyway.
+    pub clippy: bool,
 }
 
 impl Default for ClangdOptions {
@@ -81,7 +85,9 @@ impl Default for ClangdOptions {
         // clang-tidy's bugprone-*/clang-analyzer-*/readability-* families barely intersect that,
         // so suppressing it cost most of clangd's actionable diagnostics to avoid an overlap that
         // is nearly empty.
-        Self { clang_tidy: true }
+        // Both ON. See the clang-tidy note above; clippy is the same argument for Rust, where
+        // it is the difference between compiler errors and actual lint feedback.
+        Self { clang_tidy: true, clippy: true }
     }
 }
 
@@ -330,7 +336,7 @@ impl LspServer {
             exit_flushed,
         };
         // Fire initialize immediately — the only message allowed pre-handshake.
-        let params = crate::capabilities::initialize_params(root, kind);
+        let params = crate::capabilities::initialize_params(root, kind, clangd);
         server.send_request_now("initialize", params, PendingKind::Initialize);
         Ok(server)
     }
@@ -891,9 +897,9 @@ mod clangd_arg_tests {
 
     #[test]
     fn clang_tidy_flag_tracks_the_option() {
-        let on = clangd_args(ClangdOptions { clang_tidy: true }, None);
+        let on = clangd_args(ClangdOptions { clang_tidy: true, ..Default::default() }, None);
         assert!(on.iter().any(|a| a == "--clang-tidy=1"), "{on:?}");
-        let off = clangd_args(ClangdOptions { clang_tidy: false }, None);
+        let off = clangd_args(ClangdOptions { clang_tidy: false, ..Default::default() }, None);
         assert!(off.iter().any(|a| a == "--clang-tidy=0"), "{off:?}");
     }
 
@@ -916,7 +922,7 @@ mod clangd_arg_tests {
     #[test]
     fn header_insertion_stays_off() {
         for tidy in [true, false] {
-            let a = clangd_args(ClangdOptions { clang_tidy: tidy }, None);
+            let a = clangd_args(ClangdOptions { clang_tidy: tidy, ..Default::default() }, None);
             assert!(a.iter().any(|x| x == "--header-insertion=never"), "{a:?}");
         }
     }
