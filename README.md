@@ -1,110 +1,60 @@
-# Cauldron 🜍
+# Cauldron
 
-A native **Rust + egui/wgpu IDE** — JetBrains-style layout and flow, local-first AI, and a
-NASA/JPL **Power-of-Ten** enforcement layer aimed at flight-software work such as
-[NASA cFS](https://github.com/nasa/cFS). Raw code goes in; standards-compliant code comes out.
+A native Rust IDE, rendered with egui/wgpu, built to write flight-software-grade C and Rust — with a NASA/JPL Power-of-Ten rule checker running as live diagnostics instead of a separate lint pass.
 
-No JVM, no Electron, no account, no telemetry — a single native binary that starts instantly.
-
-## Why it exists
-
-Most IDEs are either heavyweight (JVM/Electron) or thin editors bolted to plugins. Cauldron aims
-for the JetBrains *experience* on a native Rust stack, plus two things nothing else ships:
-
-- **A coding-standards layer that actually enforces.** GSFC 582 / JPL Power-of-Ten rules run as a
-  live analysis tier alongside the language server — unbounded loops, dynamic allocation, missing
-  assertions, deep pointer indirection, recursion, `goto`, token pasting. Violations aren't just
-  flagged: **"Show Hot Fix"** sends the offending span to an AI and applies the refactor back over
-  it, undo-safely.
-- **AI that runs on your machine.** Ghost-text completion and the assistant panel talk to a local
-  [Ollama](https://ollama.com) model by default (fill-in-the-middle for completion), so it works
-  offline with nothing leaving the box. A Claude backend is available too, and a failed cloud call
-  degrades gracefully to the local model.
+Cauldron is a JetBrains-style editor (project tree, tabs, run configs, integrated terminal, git panel) with no JVM, no Electron shell, and no telemetry — a single native binary. Its point of difference is the lint layer: a hand-written tree-sitter-based analyzer walks C source for the classic Power-of-Ten violations (unbounded recursion, unbounded loops, dynamic allocation after init, missing assertions, deep pointer indirection, and more) and surfaces them as editor squiggles with the JPL rule citation attached, backed by a whole-program call-graph index for cross-file recursion detection. The target workload is code like NASA cFS — C written under hard static-analysis constraints.
 
 ## Features
 
-**Editing** — rope buffer with incremental tree-sitter, virtualized paint, multi-caret, column
-select, folds, soft wrap (CJK/wide-char aware), rainbow brackets, snippets with tab-stops,
-inline blame, auto-save.
+- **Editing** — rope-based buffer (`ropey`), incremental tree-sitter parsing and highlighting, multi-caret selection, snippets/live templates, viewport-virtualized rendering for large files
+- **NASA/JPL diagnostics** — Power-of-Ten rules 1–5, 8, 9 checked live via `cauldron-lint`, with stable fingerprints for baseline suppression and a witness chain for recursion cycles
+- **Whole-program indexing** — `cauldron-psi` builds a cross-file call graph (including macro-textual vs. preprocessed vs. config-gated tiers) to catch recursion the file-local analyzer can't see
+- **Language intelligence** — LSP client (`cauldron-lsp`) supporting clangd, rust-analyzer, pyright, TS/JS, CSS/HTML, JSON/YAML, C#, and jdtls
+- **Debugging** — DAP client (`cauldron-dap`) for breakpoints, stepping, and inspection
+- **Version control** — git panel: blame, diff view, conflict resolution, history
+- **Integrated terminal** — a vendored terminal emulator (`cider`, on `alacritty_terminal`) with its own eframe/wgpu render loop
+- **Local AI** — optional Ollama-backed ghost-text completion and refactor assistance, wired to send Power-of-Ten violation spans directly to the model for a "hot fix"
 
-**Language intelligence** — LSP client (clangd, rust-analyzer, pyright, TypeScript, CSS/HTML,
-JSON, YAML, C#, Java/jdtls) with completion ranking, signature help, inlay hints, code actions,
-rename, go-to-definition/implementation, call hierarchy, and a workspace symbol index. Missing
-servers install themselves.
+## Architecture
 
-**Debugging** — DAP client (lldb-dap, debugpy, netcoredbg) with breakpoints and conditions,
-exception breakpoints, threads view, watches, and inline variable values at the stop point.
-Build-before-debug so you never debug a stale binary.
+Cargo workspace of focused crates:
 
-**Version control** — status/stage/commit, diff viewer, blame, log with cherry-pick/revert/
-soft-reset, stashes, an in-editor merge-conflict resolver, PR review panel, and AI-drafted commit
-messages.
+- `cauldron` — the app itself (egui/eframe UI, panels, project/workspace state)
+- `cauldron-editor` — the text engine: buffer, syntax, selection, highlighting, the virtualized editor widget
+- `cauldron-lsp` — LSP client with its own threaded stdio transport (no tokio)
+- `cauldron-dap` — DAP client for debugger integration
+- `cauldron-psi` — whole-program C/Rust index and call graph, used for cross-file lint and navigation
+- `cauldron-lint` — the Power-of-Ten rule engine and standalone CLI
+- `cider` — vendored terminal emulator, its own eframe/wgpu binary embedded via PTY
+- `livewall-uikit` — shared theme/chrome used by `cauldron` and `cider`
 
-**Navigation** — Search Everywhere (double-Shift), quick-open, symbol search, find/replace in
-files, recent locations, structure view, bookmarks.
+Rendering goes through eframe's `wgpu` backend (pinned to Vulkan by default to avoid backend-probing overhead), not hand-rolled wgpu code — the app is built on egui's immediate-mode widget model, with `cauldron-editor`'s `EditorView` as the main custom widget.
 
-**Extras** — local history with labels (a safety net independent of git), integrated terminal,
-run/debug configurations, test runner with coverage, markdown preview, and a live web preview
-server with auto-reload for HTML/CSS work.
-
-## Crates
-
-| crate | what |
-|---|---|
-| `crates/cauldron` | the IDE application (eframe/egui) |
-| `crates/cauldron-editor` | text engine: rope + incremental tree-sitter + virtualized egui widget |
-| `crates/cauldron-lsp` | LSP client: threads-not-tokio, incremental `didChange` from transactions |
-| `crates/cauldron-dap` | Debug Adapter Protocol client |
-| `crates/cauldron-psi` | whole-program C index (call graph, Power-of-Ten Rule-1 analysis) |
-| `crates/cauldron-lint` | Power-of-Ten analyzer + clang-tidy/cppcheck adapters; also a CLI |
-| `crates/cider` | integrated terminal (PTY + VTE), vendored from the author's Rune desktop |
-| `crates/livewall-uikit` | shared chrome/theme, vendored from the author's Rune desktop |
-| `vendor/egui-winit` | patched `egui-winit` (clipboard under Wayland) — see its `VENDORED.md` |
+The buffer only mutates through a single `Transaction` chokepoint, which feeds undo/redo, incremental tree-sitter reparsing, and LSP `didChange` notifications from one source of truth.
 
 ## Building
-
-Rust stable and a Linux desktop (Wayland or X11). The repository is self-contained:
-
-```sh
-cargo build --release
-cargo test --workspace
-```
-
-The binary lands at `target/release/cauldron`. To install it with a desktop entry:
-
-```sh
-install -Dm755 target/release/cauldron ~/.local/bin/cauldron
-```
-
-System dependencies on a Debian/Ubuntu-like host:
 
 ```sh
 sudo apt install libgtk-3-dev libxkbcommon-dev libwayland-dev \
   libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev
+
+cargo build --release
+cargo test --workspace
 ```
 
-egui/eframe are pinned to **0.29.1** (wgpu 22.1.0); the vendored `egui-winit` patch is tied to
-that line, so don't bump one without the other.
+Run with `cauldron [PATH]`, where `PATH` is a file or project directory (defaults to the current directory).
 
-### Optional: local AI
-
-Install [Ollama](https://ollama.com) and pull the default models:
+Optional local AI features require [Ollama](https://ollama.com):
 
 ```sh
-ollama pull qwen2.5-coder:1.5b-base   # fill-in-the-middle ghost text
-ollama pull qwen2.5-coder:7b          # assistant / refactoring
+ollama pull qwen2.5-coder:1.5b-base   # ghost-text completion
+ollama pull qwen2.5-coder:7b          # assistant / refactor
 ```
-
-On a machine with an NVIDIA GPU, make sure you have the CUDA-enabled Ollama build (on Arch:
-`ollama-cuda`, not `ollama`) or inference silently falls back to the CPU. Models and the server
-URL are configurable in **Settings ▸ AI**.
 
 ## Status
 
-Actively developed and used daily by the author. Linux-first; the Wayland/X11 feature set and the
-window chrome assume a Linux desktop.
+Actively developed and used daily by the author. Linux-first (Wayland/X11). CI builds and tests the full workspace on every change; clippy runs advisory-only.
 
 ## License
 
-MIT — see [LICENSE](LICENSE). The `vendor/` directory contains third-party code under its own
-upstream licence.
+MIT.
